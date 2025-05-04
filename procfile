@@ -1,1 +1,1 @@
-worker: python3 vanishguy.py
+start: python vanishguy.py
