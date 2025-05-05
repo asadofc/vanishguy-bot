@@ -112,7 +112,7 @@ async def check_inactivity(app):
             for user_id, last_time in list(users.items()):
                 if user_id not in afk_users.get(chat_id, {}):
                     inactive_time = now - last_time
-                    if inactive_time > timedelta(minutes=5):
+                    if inactive_time > timedelta(minutes=60):
                         afk_users.setdefault(chat_id, {})[user_id] = {"since": last_time, "reason": "No activity"}
         await asyncio.sleep(60)
 
