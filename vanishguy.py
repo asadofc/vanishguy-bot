@@ -41,24 +41,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     
-    keyboard = [
-        [
-            InlineKeyboardButton("Updates", url="https://t.me/WorkGlows"),
-            InlineKeyboardButton("Support", url="https://t.me/TheCryptoElders"),
-        ],
-        [
-            InlineKeyboardButton("Repository", url="https://github.com/asadofc/vanishguy-bot")
-    
-    await update.message.reply_html(
-        f"👋 Hello, {user.mention_html()}!\n\n"
-        "I'm your friendly <b>AFK Assistant Bot</b> 🤖.\n\n"
-        "Here’s what I can do for you:\n"
-        "🔹 <b>/afk [reason]</b> — Let everyone know you're away.\n"
-        "🔹 <b>/back</b> — Tell everyone you're back!\n\n"
-        "⏰ I'll also mark you AFK if you're inactive for a while.\n\n"
-        "<i>Stay active, stay awesome!</i> ✨",
-        reply_markup=keyboard
-    )
+    keyboard = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Updates", url="https://t.me/WorkGlows"),
+     InlineKeyboardButton("Support", url="https://t.me/TheCryptoElders")],
+    [InlineKeyboardButton("Repository", url="https://github.com/asadofc/vanishguy-bot")]
+])
+
+await update.message.reply_html(
+    f"👋 Hello, {user.mention_html()}!\n\n"
+    "I'm your friendly <b>AFK Assistant Bot</b> 🤖.\n\n"
+    "Here’s what I can do for you:\n"
+    "🔹 <b>/afk [reason]</b> — Let everyone know you're away.\n"
+    "🔹 <b>/back</b> — Tell everyone you're back!\n\n"
+    "⏰ I'll also mark you AFK if you're inactive for a while.\n\n"
+    "<i>Stay active, stay awesome!</i> ✨",
+    reply_markup=keyboard
+)
 
 async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
