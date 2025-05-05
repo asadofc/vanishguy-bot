@@ -43,8 +43,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Updates", url="https://t.me/WorkGlows"),
-         InlineKeyboardButton("Support", url="https://t.me/TheCryptoElders"),
-         InlineKeyboardButton("Repository", url="https://github.com/asadofc/vanishguy-bot")]
+         InlineKeyboardButton("Support", url="https://t.me/TheCryptoElders")],
+        [InlineKeyboardButton("Repository", url="https://github.com/asadofc/vanishguy-bot")]
     ])
     
     await update.message.reply_html(
