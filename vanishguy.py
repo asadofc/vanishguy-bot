@@ -40,12 +40,13 @@ def format_afk_time(delta):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Updates", url="https://t.me/WorkGlows"),
          InlineKeyboardButton("Support", url="https://t.me/TheCryptoElders")],
+        [InlineKeyboardButton("Add Me To Your Group", url="https://t.me/vanishguybot?startgroup=true")]
     ])
-    
+
     await update.message.reply_html(
         f"👋 Hello, {user.mention_html()}!\n\n"
         "I'm your friendly <b>AFK Assistant Bot</b> 🤖.\n\n"
