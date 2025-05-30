@@ -37,7 +37,7 @@ Keep your group chats clean and informed by letting others know when you're away
 
 - **Language:** Python  
 - **Framework:** [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)  
-- **Database:** SQLite3  
+- **Database:** PostgreSQL  
 - **Deployment:** Railway  
 
 ---
