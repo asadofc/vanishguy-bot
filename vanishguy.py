@@ -233,6 +233,10 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"AFK bot is alive!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
 def start_dummy_server():
     port = int(os.environ.get("PORT", 10000))  # Render injects this
     server = HTTPServer(("0.0.0.0", port), DummyHandler)
