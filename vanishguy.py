@@ -8,6 +8,10 @@ import os
 import asyncpg
 from dotenv import load_dotenv
 
+# ─── Imports for Dummy HTTP Server ──────────────────────────────────────────
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 nest_asyncio.apply()
 load_dotenv()
 
@@ -222,5 +226,23 @@ async def main():
     await app.run_polling()
 
 
+# ─── Dummy HTTP Server to Keep Render Happy ─────────────────────────────────
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"AFK bot is alive!")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 10000))  # Render injects this
+    server = HTTPServer(("0.0.0.0", port), DummyHandler)
+    print(f"Dummy server listening on port {port}")
+    server.serve_forever()
+
+
 if __name__ == "__main__":
+    # Start dummy HTTP server (needed for Render health check)
+    threading.Thread(target=start_dummy_server, daemon=True).start()
+
+    # Start the Telegram polling bot
     asyncio.get_event_loop().run_until_complete(main())
