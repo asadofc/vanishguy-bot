@@ -115,6 +115,18 @@ def format_afk_time(delta):
     return " ".join(parts)
 
 
+async def delete_message_after(message, delay: int):
+    """
+    Sleep for `delay` seconds and then delete the given message.
+    """
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except Exception:
+        # In case the message is already deleted or bot lacks permissions
+        pass
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
@@ -153,9 +165,11 @@ async def back_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if afk:
         delta = datetime.now(timezone.utc) - afk["since"]
         await db.remove_afk(chat_id, user.id)
-        await update.message.reply_html(
+        # Send the "Welcome back" message and schedule deletion
+        sent_msg = await update.message.reply_html(
             f"Welcome back {user.mention_html()}! You were AFK for {format_afk_time(delta)}."
         )
+        asyncio.create_task(delete_message_after(sent_msg, 15))
     else:
         await update.message.reply_text("You are not AFK.")
 
@@ -167,26 +181,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.is_bot:
         return
+
     now = datetime.now(timezone.utc)
     await db.update_last_seen(chat_id, user.id, now)
 
+    # If the user who just sent a message was AFK, remove and announce
     afk = await db.get_afk(chat_id, user.id)
     if afk:
         delta = now - afk["since"]
         await db.remove_afk(chat_id, user.id)
-        await update.message.reply_html(
+        sent_msg = await update.message.reply_html(
             f"Welcome back {user.mention_html()}! You were AFK for {format_afk_time(delta)}."
         )
+        asyncio.create_task(delete_message_after(sent_msg, 15))
 
+    # If someone replied to an AFK user, announce their AFK status
     if update.message.reply_to_message:
         replied_user = update.message.reply_to_message.from_user
         if replied_user:
             afk = await db.get_afk(chat_id, replied_user.id)
             if afk:
                 delta = now - afk["since"]
-                await update.message.reply_html(
+                sent_msg = await update.message.reply_html(
                     f"{replied_user.mention_html()} is currently AFK ({afk['reason']}) — for {format_afk_time(delta)}."
                 )
+                asyncio.create_task(delete_message_after(sent_msg, 15))
 
 
 async def check_inactivity():
