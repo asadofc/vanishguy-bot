@@ -1,9 +1,5 @@
-#python-telegram-bot==20.3
-#nest_asyncio==1.5.8
+python-telegram-bot==20.3
+nest_asyncio==1.5.8
 #asyncpg==0.27.0
-#python-dotenv==1.0.0
-#pymongo==4.6.1
-aiogram==3.2.0
-python-dotenv==1.0.1
-pymongo==4.7.2
-aiohttp==3.9.5
+python-dotenv==1.0.0
+pymongo==4.6.1
