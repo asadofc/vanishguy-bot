@@ -9,19 +9,45 @@ import json
 import threading
 from dotenv import load_dotenv
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 nest_asyncio.apply()
 load_dotenv()
 
 TOKEN = os.environ.get("BOT_TOKEN")
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
+MONGODB_URL = os.environ.get("MONGODB_URL")
 
-# JSON Data Manager
+# MongoDB Data Manager (using same interface as original JSON version)
 class DataManager:
     def __init__(self, file_name=DATA_FILE):
         self.file_name = file_name
         self.lock = threading.Lock()
-        self.data = self._load()
+        
+        # Try MongoDB first
+        if MONGODB_URL:
+            try:
+                self.client = MongoClient(MONGODB_URL, serverSelectionTimeoutMS=5000)
+                # Test connection
+                self.client.admin.command('ping')
+                self.db = self.client.afk_bot
+                self.afk_collection = self.db.afk_data
+                self.last_seen_collection = self.db.last_seen_data
+                self.leaderboard_collection = self.db.leaderboard_data
+                print("MongoDB connected successfully")
+                self.use_mongodb = True
+            except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+                print(f"MongoDB connection failed: {e}")
+                print("Falling back to JSON storage")
+                self.use_mongodb = False
+        else:
+            print("MongoDB URL not provided, using JSON storage")
+            self.use_mongodb = False
+        
+        # Fallback to JSON if MongoDB not available
+        if not self.use_mongodb:
+            self.data = self._load()
 
     def _load(self):
         if not os.path.exists(self.file_name):
@@ -34,25 +60,60 @@ class DataManager:
             json.dump(self.data, f, indent=4)
 
     async def set_afk(self, chat_id, user_id, reason, since):
-        def _sync():
+        def _sync_mongodb():
+            with self.lock:
+                key = f"{chat_id}:{user_id}"
+                doc = {
+                    "_id": key,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "reason": reason,
+                    "since": since.isoformat()
+                }
+                self.afk_collection.replace_one({"_id": key}, doc, upsert=True)
+        
+        def _sync_json():
             with self.lock:
                 self.data.setdefault("afk", {})
                 key = f"{chat_id}:{user_id}"
                 self.data["afk"][key] = {"reason": reason, "since": since.isoformat()}
                 self._save()
-        await asyncio.to_thread(_sync)
+        
+        if self.use_mongodb:
+            await asyncio.to_thread(_sync_mongodb)
+        else:
+            await asyncio.to_thread(_sync_json)
 
     async def remove_afk(self, chat_id, user_id):
-        def _sync():
+        def _sync_mongodb():
+            with self.lock:
+                key = f"{chat_id}:{user_id}"
+                self.afk_collection.delete_one({"_id": key})
+        
+        def _sync_json():
             with self.lock:
                 key = f"{chat_id}:{user_id}"
                 if key in self.data.get("afk", {}):
                     del self.data["afk"][key]
                     self._save()
-        await asyncio.to_thread(_sync)
+        
+        if self.use_mongodb:
+            await asyncio.to_thread(_sync_mongodb)
+        else:
+            await asyncio.to_thread(_sync_json)
 
     async def get_afk(self, chat_id, user_id):
-        def _sync():
+        def _sync_mongodb():
+            key = f"{chat_id}:{user_id}"
+            doc = self.afk_collection.find_one({"_id": key})
+            if not doc:
+                return None
+            return {
+                "reason": doc["reason"],
+                "since": datetime.fromisoformat(doc["since"]).replace(tzinfo=timezone.utc)
+            }
+        
+        def _sync_json():
             key = f"{chat_id}:{user_id}"
             entry = self.data.get("afk", {}).get(key)
             if not entry:
@@ -60,19 +121,48 @@ class DataManager:
             entry_copy = entry.copy()
             entry_copy["since"] = datetime.fromisoformat(entry_copy["since"]).replace(tzinfo=timezone.utc)
             return entry_copy
-        return await asyncio.to_thread(_sync)
+        
+        if self.use_mongodb:
+            return await asyncio.to_thread(_sync_mongodb)
+        else:
+            return await asyncio.to_thread(_sync_json)
 
     async def update_last_seen(self, chat_id, user_id, seen_at):
-        def _sync():
+        def _sync_mongodb():
+            with self.lock:
+                key = f"{chat_id}:{user_id}"
+                doc = {
+                    "_id": key,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "seen_at": seen_at.isoformat()
+                }
+                self.last_seen_collection.replace_one({"_id": key}, doc, upsert=True)
+        
+        def _sync_json():
             with self.lock:
                 self.data.setdefault("last_seen", {})
                 key = f"{chat_id}:{user_id}"
                 self.data["last_seen"][key] = seen_at.isoformat()
                 self._save()
-        await asyncio.to_thread(_sync)
+        
+        if self.use_mongodb:
+            await asyncio.to_thread(_sync_mongodb)
+        else:
+            await asyncio.to_thread(_sync_json)
 
     async def get_all_last_seen(self):
-        def _sync():
+        def _sync_mongodb():
+            items = []
+            for doc in self.last_seen_collection.find():
+                items.append({
+                    "chat_id": doc["chat_id"],
+                    "user_id": doc["user_id"],
+                    "seen_at": datetime.fromisoformat(doc["seen_at"]).replace(tzinfo=timezone.utc)
+                })
+            return items
+        
+        def _sync_json():
             items = []
             for key, iso in self.data.get("last_seen", {}).items():
                 chat_id, user_id = key.split(":")
@@ -82,7 +172,11 @@ class DataManager:
                     "seen_at": datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
                 })
             return items
-        return await asyncio.to_thread(_sync)
+        
+        if self.use_mongodb:
+            return await asyncio.to_thread(_sync_mongodb)
+        else:
+            return await asyncio.to_thread(_sync_json)
 
 data = DataManager()
 
@@ -130,7 +224,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         f"👋 Hello, {user.mention_html()}!\n\n"
         "I'm your friendly <b>AFK Assistant Bot</b> 🤖.\n\n"
-        "Here’s what I can do for you:\n"
+        "Here's what I can do for you:\n"
         "🔹 <b>/afk [reason]</b> — Let everyone know you're away.\n"
         "🔹 <b>/back</b> — Tell everyone you're back!\n\n"
         "⏰ I'll also mark you AFK if you're inactive for a while.\n\n"
