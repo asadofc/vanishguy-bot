@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+python-telegram-bot==20.3
 nest_asyncio==1.5.8
 #asyncpg==0.27.0
 python-dotenv==1.0.0
