@@ -1,184 +1,154 @@
-import asyncio
-from datetime import datetime, timezone, timedelta
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import nest_asyncio
 import os
 import json
-import threading
-from dotenv import load_dotenv
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+import time
+import random
+import asyncio
+import nest_asyncio
 
+import threading
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from dotenv import load_dotenv
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# Initialize
 nest_asyncio.apply()
 load_dotenv()
 
+# Configuration
 TOKEN = os.environ.get("BOT_TOKEN")
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
-MONGODB_URL = os.environ.get("MONGODB_URL")
 
-# MongoDB Data Manager (using same interface as original JSON version)
-class DataManager:
-    def __init__(self, file_name=DATA_FILE):
-        self.file_name = file_name
-        self.lock = threading.Lock()
-        
-        # Try MongoDB first
-        if MONGODB_URL:
-            try:
-                self.client = MongoClient(MONGODB_URL, serverSelectionTimeoutMS=5000)
-                # Test connection
-                self.client.admin.command('ping')
-                self.db = self.client.afk_bot
-                self.afk_collection = self.db.afk_data
-                self.last_seen_collection = self.db.last_seen_data
-                self.leaderboard_collection = self.db.leaderboard_data
-                print("MongoDB connected successfully")
-                self.use_mongodb = True
-            except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-                print(f"MongoDB connection failed: {e}")
-                print("Falling back to JSON storage")
-                self.use_mongodb = False
-        else:
-            print("MongoDB URL not provided, using JSON storage")
-            self.use_mongodb = False
-        
-        # Fallback to JSON if MongoDB not available
-        if not self.use_mongodb:
-            self.data = self._load()
+# Message dictionaries
+START_MESSAGE = [
+    "👋 Hello, {user}!",
+    "I'm your friendly <b>AFK Assistant Bot</b> 🤖.",
+    "",
+    "Here's what I can do for you:",
+    "🔹 <b>/afk [reason]</b> — Let everyone know you're away.",
+    "🔹 <b>/back</b> — Tell everyone you're back!",
+    "",
+    "⏰ I'll also mark you AFK if you're inactive for a while.",
+    "",
+    "<i>Stay active, stay awesome!</i> ✨"
+]
 
-    def _load(self):
-        if not os.path.exists(self.file_name):
-            return {"leaderboard": {}, "afk": {}, "last_seen": {}}
-        with open(self.file_name, "r") as f:
-            return json.load(f)
+AFK_MESSAGES = [
+    "{user} is now AFK: {reason}",
+    "{user} has gone AFK: {reason}",
+    "{user} is away: {reason}",
+    "{user} stepped away: {reason}",
+    "{user} is taking a break: {reason}",
+    "{user} is currently unavailable: {reason}",
+    "{user} has left the chat temporarily: {reason}",
+    "{user} is offline: {reason}"
+]
 
-    def _save(self):
-        with open(self.file_name, "w") as f:
-            json.dump(self.data, f, indent=4)
+BACK_MESSAGES = [
+    "Welcome back {user}! You were AFK for {duration}.",
+    "{user} is back! Was away for {duration}.",
+    "{user} has returned after being AFK for {duration}.",
+    "Hey {user}! You're back after {duration} of being away.",
+    "{user} is online again! Was AFK for {duration}.",
+    "Good to see you back {user}! You were away for {duration}.",
+    "{user} has rejoined us after {duration} of AFK time.",
+    "Welcome back {user}! Your AFK lasted {duration}."
+]
 
-    async def set_afk(self, chat_id, user_id, reason, since):
-        def _sync_mongodb():
-            with self.lock:
-                key = f"{chat_id}:{user_id}"
-                doc = {
-                    "_id": key,
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "reason": reason,
-                    "since": since.isoformat()
-                }
-                self.afk_collection.replace_one({"_id": key}, doc, upsert=True)
-        
-        def _sync_json():
-            with self.lock:
-                self.data.setdefault("afk", {})
-                key = f"{chat_id}:{user_id}"
-                self.data["afk"][key] = {"reason": reason, "since": since.isoformat()}
-                self._save()
-        
-        if self.use_mongodb:
-            await asyncio.to_thread(_sync_mongodb)
-        else:
-            await asyncio.to_thread(_sync_json)
+AFK_STATUS_MESSAGES = [
+    "{user} is currently away: {reason}. Been offline for {duration}",
+    "{user} stepped away: {reason}. Inactive for {duration}",
+    "{user} is AFK: {reason}. Last seen {duration} ago",
+    "{user} left temporarily: {reason}. Away for {duration}",
+    "{user} is taking time off: {reason}. Been gone for {duration}",
+    "{user} went offline: {reason}. Unavailable for {duration}",
+    "{user} is unreachable: {reason}. Missing for {duration}",
+    "{user} stepped out: {reason}. Been away for {duration}"
+]
 
-    async def remove_afk(self, chat_id, user_id):
-        def _sync_mongodb():
-            with self.lock:
-                key = f"{chat_id}:{user_id}"
-                self.afk_collection.delete_one({"_id": key})
-        
-        def _sync_json():
-            with self.lock:
-                key = f"{chat_id}:{user_id}"
-                if key in self.data.get("afk", {}):
-                    del self.data["afk"][key]
-                    self._save()
-        
-        if self.use_mongodb:
-            await asyncio.to_thread(_sync_mongodb)
-        else:
-            await asyncio.to_thread(_sync_json)
+# Global lock for file operations
+file_lock = threading.Lock()
 
-    async def get_afk(self, chat_id, user_id):
-        def _sync_mongodb():
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {"leaderboard": {}, "afk": {}, "last_seen": {}}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+async def set_afk(chat_id, user_id, reason, since):
+    def _sync_operation():
+        with file_lock:
+            data = load_data()
+            data.setdefault("afk", {})
             key = f"{chat_id}:{user_id}"
-            doc = self.afk_collection.find_one({"_id": key})
-            if not doc:
-                return None
-            return {
-                "reason": doc["reason"],
-                "since": datetime.fromisoformat(doc["since"]).replace(tzinfo=timezone.utc)
-            }
-        
-        def _sync_json():
+            data["afk"][key] = {"reason": reason, "since": since.isoformat()}
+            save_data(data)
+    
+    await asyncio.to_thread(_sync_operation)
+
+async def remove_afk(chat_id, user_id):
+    def _sync_operation():
+        with file_lock:
+            data = load_data()
             key = f"{chat_id}:{user_id}"
-            entry = self.data.get("afk", {}).get(key)
-            if not entry:
-                return None
-            entry_copy = entry.copy()
-            entry_copy["since"] = datetime.fromisoformat(entry_copy["since"]).replace(tzinfo=timezone.utc)
-            return entry_copy
-        
-        if self.use_mongodb:
-            return await asyncio.to_thread(_sync_mongodb)
-        else:
-            return await asyncio.to_thread(_sync_json)
+            if key in data.get("afk", {}):
+                del data["afk"][key]
+                save_data(data)
+    
+    await asyncio.to_thread(_sync_operation)
 
-    async def update_last_seen(self, chat_id, user_id, seen_at):
-        def _sync_mongodb():
-            with self.lock:
-                key = f"{chat_id}:{user_id}"
-                doc = {
-                    "_id": key,
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "seen_at": seen_at.isoformat()
-                }
-                self.last_seen_collection.replace_one({"_id": key}, doc, upsert=True)
-        
-        def _sync_json():
-            with self.lock:
-                self.data.setdefault("last_seen", {})
-                key = f"{chat_id}:{user_id}"
-                self.data["last_seen"][key] = seen_at.isoformat()
-                self._save()
-        
-        if self.use_mongodb:
-            await asyncio.to_thread(_sync_mongodb)
-        else:
-            await asyncio.to_thread(_sync_json)
+async def get_afk(chat_id, user_id):
+    def _sync_operation():
+        data = load_data()
+        key = f"{chat_id}:{user_id}"
+        entry = data.get("afk", {}).get(key)
+        if not entry:
+            return None
+        entry_copy = entry.copy()
+        entry_copy["since"] = datetime.fromisoformat(entry_copy["since"]).replace(tzinfo=timezone.utc)
+        return entry_copy
+    
+    return await asyncio.to_thread(_sync_operation)
 
-    async def get_all_last_seen(self):
-        def _sync_mongodb():
-            items = []
-            for doc in self.last_seen_collection.find():
-                items.append({
-                    "chat_id": doc["chat_id"],
-                    "user_id": doc["user_id"],
-                    "seen_at": datetime.fromisoformat(doc["seen_at"]).replace(tzinfo=timezone.utc)
-                })
-            return items
-        
-        def _sync_json():
-            items = []
-            for key, iso in self.data.get("last_seen", {}).items():
-                chat_id, user_id = key.split(":")
-                items.append({
-                    "chat_id": int(chat_id),
-                    "user_id": int(user_id),
-                    "seen_at": datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
-                })
-            return items
-        
-        if self.use_mongodb:
-            return await asyncio.to_thread(_sync_mongodb)
-        else:
-            return await asyncio.to_thread(_sync_json)
+async def update_last_seen(chat_id, user_id, seen_at):
+    def _sync_operation():
+        with file_lock:
+            data = load_data()
+            data.setdefault("last_seen", {})
+            key = f"{chat_id}:{user_id}"
+            data["last_seen"][key] = seen_at.isoformat()
+            save_data(data)
+    
+    await asyncio.to_thread(_sync_operation)
 
-data = DataManager()
+async def get_all_last_seen():
+    def _sync_operation():
+        data = load_data()
+        items = []
+        for key, iso in data.get("last_seen", {}).items():
+            chat_id, user_id = key.split(":")
+            items.append({
+                "chat_id": int(chat_id),
+                "user_id": int(user_id),
+                "seen_at": datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+            })
+        return items
+    
+    return await asyncio.to_thread(_sync_operation)
 
 def format_afk_time(delta):
     seconds = int(delta.total_seconds())
@@ -202,15 +172,23 @@ def format_afk_time(delta):
         parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
     return " ".join(parts)
 
-async def delete_message_after(message, delay: int):
-    await asyncio.sleep(delay)
+def create_delete_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️", callback_data="delete_message")]
+    ])
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
     try:
-        await message.delete()
+        await query.message.delete()
+        await query.answer("🗑️ Message deleted!", show_alert=False)
     except Exception:
-        pass
+        await query.answer("💬 Failed to delete message!", show_alert=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    bot_username = context.bot.username
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     keyboard = InlineKeyboardMarkup([
         [
@@ -218,43 +196,73 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("Support", url="https://t.me/SoulMeetsHQ")
         ],
         [
-            InlineKeyboardButton("Add Me To Your Group", url="https://t.me/vanishguybot?startgroup=true")
+            InlineKeyboardButton("Add Me To Your Group", url=f"https://t.me/{bot_username}?startgroup=true")
         ]
     ])
-    await update.message.reply_html(
-        f"👋 Hello, {user.mention_html()}!\n\n"
-        "I'm your friendly <b>AFK Assistant Bot</b> 🤖.\n\n"
-        "Here's what I can do for you:\n"
-        "🔹 <b>/afk [reason]</b> — Let everyone know you're away.\n"
-        "🔹 <b>/back</b> — Tell everyone you're back!\n\n"
-        "⏰ I'll also mark you AFK if you're inactive for a while.\n\n"
-        "<i>Stay active, stay awesome!</i> ✨",
-        reply_markup=keyboard
-    )
+    
+    message_text = "\n".join(START_MESSAGE).format(user=user.mention_html())
+    
+    await update.message.reply_html(message_text, reply_markup=keyboard)
 
 async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     reason = " ".join(context.args) if context.args else "AFK"
     now = datetime.now(timezone.utc)
-    await data.set_afk(chat_id, user.id, reason, now)
-    sent_msg = await update.message.reply_html(f"{user.mention_html()} is now AFK: {reason}")
-    asyncio.create_task(delete_message_after(sent_msg, 30))
+    await set_afk(chat_id, user.id, reason, now)
+    
+    message = random.choice(AFK_MESSAGES).format(
+        user=user.mention_html(),
+        reason=reason
+    )
+    
+    sent_msg = await update.message.reply_html(
+        message,
+        reply_markup=create_delete_keyboard()
+    )
 
 async def back_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
-    afk = await data.get_afk(chat_id, user.id)
+    afk = await get_afk(chat_id, user.id)
     if afk:
         delta = datetime.now(timezone.utc) - afk["since"]
-        await data.remove_afk(chat_id, user.id)
-        sent_msg = await update.message.reply_html(
-            f"Welcome back {user.mention_html()}! You were AFK for {format_afk_time(delta)}."
+        await remove_afk(chat_id, user.id)
+        
+        message = random.choice(BACK_MESSAGES).format(
+            user=user.mention_html(),
+            duration=format_afk_time(delta)
         )
-        asyncio.create_task(delete_message_after(sent_msg, 30))
+        
+        sent_msg = await update.message.reply_html(
+            message,
+            reply_markup=create_delete_keyboard()
+        )
     else:
-        sent_msg = await update.message.reply_text("You are not AFK.")
-        asyncio.create_task(delete_message_after(sent_msg, 30))
+        sent_msg = await update.message.reply_text(
+            "You are not AFK.",
+            reply_markup=create_delete_keyboard()
+        )
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
+    
+    # Send initial "Pinging..." message
+    sent_msg = await update.message.reply_text("🛰️ Pinging...")
+    
+    # Calculate ping time
+    end_time = time.time()
+    ping_ms = round((end_time - start_time) * 1000, 2)
+    
+    # Create the pong message with group links (no preview)
+    pong_text = f'🏓 <a href="https://t.me/SoulMeetsHQ">Pong!</a> {ping_ms}ms'
+    
+    # Edit the message to show pong result
+    await sent_msg.edit_text(
+        pong_text,
+        parse_mode='HTML',
+        disable_web_page_preview=True
+    )
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -264,54 +272,73 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.is_bot:
         return
     now = datetime.now(timezone.utc)
-    await data.update_last_seen(chat_id, user.id, now)
-    afk = await data.get_afk(chat_id, user.id)
+    await update_last_seen(chat_id, user.id, now)
+    afk = await get_afk(chat_id, user.id)
     if afk:
         delta = now - afk["since"]
-        await data.remove_afk(chat_id, user.id)
-        sent_msg = await update.message.reply_html(
-            f"Welcome back {user.mention_html()}! You were AFK for {format_afk_time(delta)}."
+        await remove_afk(chat_id, user.id)
+        
+        message = random.choice(BACK_MESSAGES).format(
+            user=user.mention_html(),
+            duration=format_afk_time(delta)
         )
-        asyncio.create_task(delete_message_after(sent_msg, 30))
+        
+        sent_msg = await update.message.reply_html(
+            message,
+            reply_markup=create_delete_keyboard()
+        )
     if update.message.reply_to_message:
         replied_user = update.message.reply_to_message.from_user
         if replied_user:
-            afk = await data.get_afk(chat_id, replied_user.id)
+            afk = await get_afk(chat_id, replied_user.id)
             if afk:
                 delta = now - afk["since"]
-                sent_msg = await update.message.reply_html(
-                    f"{replied_user.mention_html()} is currently AFK ({afk['reason']}) — for {format_afk_time(delta)}."
+                
+                message = random.choice(AFK_STATUS_MESSAGES).format(
+                    user=replied_user.mention_html(),
+                    reason=afk['reason'],
+                    duration=format_afk_time(delta)
                 )
-                asyncio.create_task(delete_message_after(sent_msg, 30))
+                
+                sent_msg = await update.message.reply_html(
+                    message,
+                    reply_markup=create_delete_keyboard()
+                )
 
 async def check_inactivity():
     await asyncio.sleep(10)
     while True:
         now = datetime.now(timezone.utc)
-        records = await data.get_all_last_seen()
+        records = await get_all_last_seen()
         for record in records:
             chat_id = record["chat_id"]
             user_id = record["user_id"]
             last_time = record["seen_at"]
             inactive_time = now - last_time
-            afk = await data.get_afk(chat_id, user_id)
+            afk = await get_afk(chat_id, user_id)
             if inactive_time > timedelta(minutes=60) and not afk:
-                await data.set_afk(chat_id, user_id, "No activity", last_time)
+                await set_afk(chat_id, user_id, "No activity", last_time)
         await asyncio.sleep(60)
 
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
+    # Only register visible commands in the menu
     await app.bot.set_my_commands([
         BotCommand("start", "Start bot and see help"),
         BotCommand("afk", "Set yourself AFK"),
         BotCommand("back", "Return from AFK"),
     ])
+    
+    # Add handlers (ping command is added but not registered in menu)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("afk", afk_command))
     app.add_handler(CommandHandler("back", back_command))
+    app.add_handler(CommandHandler("ping", ping_command))  # Hidden command
+    app.add_handler(CallbackQueryHandler(delete_callback, pattern="delete_message"))
     app.add_handler(MessageHandler(filters.ALL, message_handler))
+    
     asyncio.create_task(check_inactivity())
-    print("Bot started...")
+    print("Bot started with JSON file storage...")
     await app.run_polling()
 
 class DummyHandler(BaseHTTPRequestHandler):
