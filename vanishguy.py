@@ -4,6 +4,7 @@ import time
 import random
 import asyncio
 import asyncpg
+import nest_asyncio
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -124,6 +125,7 @@ def log_with_user_info(level: str, message: str, user_info: Dict[str, any]) -> N
         logger.info(full_message)
 
 # Initialize
+nest_asyncio.apply()
 load_dotenv()
 
 logger.info("🚀 Starting AFK Bot initialization...")
