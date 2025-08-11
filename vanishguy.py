@@ -3,6 +3,7 @@ import json
 import time
 import random
 import asyncio
+import asyncpg
 import nest_asyncio
 import logging
 import threading
@@ -131,13 +132,22 @@ logger.info("🚀 Starting AFK Bot initialization...")
 
 # Configuration
 TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
 if not TOKEN:
     logger.error("❌ BOT_TOKEN not found in environment variables!")
     exit(1)
 
-logger.info(f"📁 Using data file: {DATA_FILE}")
+if not DATABASE_URL:
+    logger.error("❌ DATABASE_URL not found in environment variables!")
+    exit(1)
+
+logger.info(f"🗄️ Using PostgreSQL database")
+logger.info(f"📁 Backup data file: {DATA_FILE}")
+
+# Global database pool
+db_pool = None
 
 # Message dictionaries
 START_MESSAGE = [
@@ -186,51 +196,124 @@ AFK_STATUS_MESSAGES = [
     "{user} stepped out: {reason}. Been away for {duration}"
 ]
 
-# Global lock for file operations
+# Global lock for file operations (backup)
 file_lock = threading.Lock()
-logger.info("🔒 File lock initialized for thread-safe operations")
 
+async def init_database():
+    """Initialize database connection and create tables"""
+    global db_pool
+    
+    logger.info("🔗 Initializing database connection...")
+    
+    try:
+        # Create connection pool
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        logger.info("✅ Database connection pool created successfully")
+        
+        # Create tables if they don't exist
+        async with db_pool.acquire() as conn:
+            # AFK status table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS afk_status (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    reason TEXT NOT NULL,
+                    since TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(chat_id, user_id)
+                )
+            ''')
+            
+            # Last seen table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS last_seen (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    seen_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(chat_id, user_id)
+                )
+            ''')
+            
+            # Create indexes for better performance
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_afk_status_chat_user 
+                ON afk_status (chat_id, user_id)
+            ''')
+            
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_last_seen_chat_user 
+                ON last_seen (chat_id, user_id)
+            ''')
+            
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_last_seen_seen_at 
+                ON last_seen (seen_at)
+            ''')
+            
+        logger.info("✅ Database tables created/verified successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}")
+        raise
+
+async def close_database():
+    """Close database connection pool"""
+    global db_pool
+    
+    if db_pool:
+        await db_pool.close()
+        logger.info("🔌 Database connection pool closed")
+
+# Backup functions (keeping JSON as fallback)
 def load_data():
-    """Load data from JSON file with error handling"""
-    logger.debug(f"📂 Loading data from {DATA_FILE}")
+    """Load data from JSON file with error handling (backup only)"""
+    logger.debug(f"📂 Loading backup data from {DATA_FILE}")
     try:
         if not os.path.exists(DATA_FILE):
-            logger.warning(f"⚠️ Data file {DATA_FILE} not found, creating new one")
+            logger.warning(f"⚠️ Backup data file {DATA_FILE} not found, creating new one")
             default_data = {"leaderboard": {}, "afk": {}, "last_seen": {}}
             save_data(default_data)
             return default_data
         
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
-            logger.debug(f"✅ Successfully loaded data with {len(data.get('afk', {}))} AFK entries and {len(data.get('last_seen', {}))} last_seen entries")
+            logger.debug(f"✅ Successfully loaded backup data")
             return data
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ JSON decode error in {DATA_FILE}: {e}")
-        logger.warning("🔄 Creating backup and using default data")
-        # Create backup of corrupted file
-        backup_file = f"{DATA_FILE}.backup_{int(time.time())}"
-        os.rename(DATA_FILE, backup_file)
-        logger.info(f"💾 Corrupted file backed up as {backup_file}")
-        return {"leaderboard": {}, "afk": {}, "last_seen": {}}
     except Exception as e:
-        logger.error(f"❌ Unexpected error loading data: {e}")
+        logger.error(f"❌ Error loading backup data: {e}")
         return {"leaderboard": {}, "afk": {}, "last_seen": {}}
 
 def save_data(data):
-    """Save data to JSON file with error handling"""
-    logger.debug(f"💾 Saving data to {DATA_FILE}")
+    """Save data to JSON file with error handling (backup only)"""
+    logger.debug(f"💾 Saving backup data to {DATA_FILE}")
     try:
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, indent=4)
-        logger.debug("✅ Data saved successfully")
+        logger.debug("✅ Backup data saved successfully")
     except Exception as e:
-        logger.error(f"❌ Error saving data to {DATA_FILE}: {e}")
+        logger.error(f"❌ Error saving backup data to {DATA_FILE}: {e}")
 
 async def set_afk(chat_id: int, user_id: int, reason: str, since: datetime):
-    """Set user as AFK with logging"""
+    """Set user as AFK with database storage"""
     logger.debug(f"⏰ Setting AFK for user {user_id} in chat {chat_id} with reason: {reason}")
     
-    def _sync_operation():
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO afk_status (chat_id, user_id, reason, since)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET reason = $3, since = $4, created_at = NOW()
+            ''', chat_id, user_id, reason, since)
+            
+        logger.info(f"✅ User {user_id} set as AFK in chat {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Error setting AFK for user {user_id}: {e}")
+        # Try backup method
         try:
             with file_lock:
                 data = load_data()
@@ -238,17 +321,26 @@ async def set_afk(chat_id: int, user_id: int, reason: str, since: datetime):
                 key = f"{chat_id}:{user_id}"
                 data["afk"][key] = {"reason": reason, "since": since.isoformat()}
                 save_data(data)
-                logger.info(f"✅ User {user_id} set as AFK in chat {chat_id}")
-        except Exception as e:
-            logger.error(f"❌ Error setting AFK for user {user_id}: {e}")
-
-    await asyncio.to_thread(_sync_operation)
+                logger.warning(f"⚠️ Used backup storage for AFK user {user_id}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def remove_afk(chat_id: int, user_id: int):
-    """Remove user from AFK status with logging"""
+    """Remove user from AFK status with database storage"""
     logger.debug(f"🔄 Removing AFK status for user {user_id} in chat {chat_id}")
     
-    def _sync_operation():
+    try:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute('''
+                DELETE FROM afk_status 
+                WHERE chat_id = $1 AND user_id = $2
+            ''', chat_id, user_id)
+            
+        logger.info(f"✅ AFK status removed for user {user_id} in chat {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Error removing AFK for user {user_id}: {e}")
+        # Try backup method
         try:
             with file_lock:
                 data = load_data()
@@ -256,41 +348,65 @@ async def remove_afk(chat_id: int, user_id: int):
                 if key in data.get("afk", {}):
                     del data["afk"][key]
                     save_data(data)
-                    logger.info(f"✅ AFK status removed for user {user_id} in chat {chat_id}")
-                else:
-                    logger.debug(f"ℹ️ User {user_id} was not AFK in chat {chat_id}")
-        except Exception as e:
-            logger.error(f"❌ Error removing AFK for user {user_id}: {e}")
-
-    await asyncio.to_thread(_sync_operation)
+                    logger.warning(f"⚠️ Used backup storage to remove AFK user {user_id}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def get_afk(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    """Get AFK status for user with logging"""
+    """Get AFK status for user with database storage"""
     logger.debug(f"🔍 Checking AFK status for user {user_id} in chat {chat_id}")
     
-    def _sync_operation():
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow('''
+                SELECT reason, since FROM afk_status 
+                WHERE chat_id = $1 AND user_id = $2
+            ''', chat_id, user_id)
+            
+        if not row:
+            logger.debug(f"ℹ️ User {user_id} is not AFK in chat {chat_id}")
+            return None
+            
+        result = {
+            "reason": row["reason"],
+            "since": row["since"].replace(tzinfo=timezone.utc)
+        }
+        logger.debug(f"✅ Found AFK status for user {user_id}: {result['reason']}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting AFK status for user {user_id}: {e}")
+        # Try backup method
         try:
             data = load_data()
             key = f"{chat_id}:{user_id}"
             entry = data.get("afk", {}).get(key)
             if not entry:
-                logger.debug(f"ℹ️ User {user_id} is not AFK in chat {chat_id}")
                 return None
             entry_copy = entry.copy()
             entry_copy["since"] = datetime.fromisoformat(entry_copy["since"]).replace(tzinfo=timezone.utc)
-            logger.debug(f"✅ Found AFK status for user {user_id}: {entry_copy['reason']}")
+            logger.warning(f"⚠️ Used backup storage for AFK check user {user_id}")
             return entry_copy
-        except Exception as e:
-            logger.error(f"❌ Error getting AFK status for user {user_id}: {e}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
             return None
 
-    return await asyncio.to_thread(_sync_operation)
-
 async def update_last_seen(chat_id: int, user_id: int, seen_at: datetime):
-    """Update last seen timestamp for user"""
+    """Update last seen timestamp for user with database storage"""
     logger.debug(f"👁️ Updating last seen for user {user_id} in chat {chat_id}")
     
-    def _sync_operation():
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO last_seen (chat_id, user_id, seen_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET seen_at = $3, updated_at = NOW()
+            ''', chat_id, user_id, seen_at)
+            
+    except Exception as e:
+        logger.error(f"❌ Error updating last seen for user {user_id}: {e}")
+        # Try backup method
         try:
             with file_lock:
                 data = load_data()
@@ -298,16 +414,36 @@ async def update_last_seen(chat_id: int, user_id: int, seen_at: datetime):
                 key = f"{chat_id}:{user_id}"
                 data["last_seen"][key] = seen_at.isoformat()
                 save_data(data)
-        except Exception as e:
-            logger.error(f"❌ Error updating last seen for user {user_id}: {e}")
-
-    await asyncio.to_thread(_sync_operation)
+                logger.warning(f"⚠️ Used backup storage for last seen user {user_id}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def get_all_last_seen() -> List[Dict[str, Any]]:
-    """Get all last seen records"""
+    """Get all last seen records with database storage"""
     logger.debug("📊 Retrieving all last seen records")
     
-    def _sync_operation():
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT chat_id, user_id, seen_at 
+                FROM last_seen
+                ORDER BY seen_at DESC
+            ''')
+            
+        items = []
+        for row in rows:
+            items.append({
+                "chat_id": row["chat_id"],
+                "user_id": row["user_id"],
+                "seen_at": row["seen_at"].replace(tzinfo=timezone.utc)
+            })
+            
+        logger.debug(f"✅ Retrieved {len(items)} last seen records from database")
+        return items
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting last seen records: {e}")
+        # Try backup method
         try:
             data = load_data()
             items = []
@@ -318,13 +454,11 @@ async def get_all_last_seen() -> List[Dict[str, Any]]:
                     "user_id": int(user_id),
                     "seen_at": datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
                 })
-            logger.debug(f"✅ Retrieved {len(items)} last seen records")
+            logger.warning(f"⚠️ Used backup storage for last seen records: {len(items)} records")
             return items
-        except Exception as e:
-            logger.error(f"❌ Error getting last seen records: {e}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
             return []
-
-    return await asyncio.to_thread(_sync_operation)
 
 def format_afk_time(delta: timedelta) -> str:
     """Format time delta into human readable string"""
@@ -593,6 +727,9 @@ async def main():
     logger.info("🤖 Starting main bot function")
     
     try:
+        # Initialize database first
+        await init_database()
+        
         app = ApplicationBuilder().token(TOKEN).build()
         logger.info("✅ Bot application built successfully")
         
@@ -620,10 +757,17 @@ async def main():
         asyncio.create_task(check_inactivity())
         logger.info("⏰ Inactivity checker task started")
         
-        logger.info("🚀 Bot started with JSON file storage...")
-        await app.run_polling()
+        logger.info("🚀 Bot started with PostgreSQL database storage...")
+        
+        try:
+            await app.run_polling()
+        finally:
+            # Clean up database connection when bot stops
+            await close_database()
+            
     except Exception as e:
         logger.error(f"❌ Critical error in main function: {e}")
+        await close_database()
         raise
 
 class DummyHandler(BaseHTTPRequestHandler):
