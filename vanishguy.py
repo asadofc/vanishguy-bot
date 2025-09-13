@@ -3,24 +3,49 @@ import json
 import time
 import random
 import asyncio
-import asyncpg
-import nest_asyncio
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Optional, List, Any
-from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, Message
-from telegram.constants import ChatAction
-from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+
+# Lazy imports for better startup performance
+asyncpg = None
+nest_asyncio = None
+load_dotenv = None
+BotCommand = None
+InlineKeyboardButton = None
+InlineKeyboardMarkup = None
+Update = None
+Message = None
+ChatAction = None
+ApplicationBuilder = None
+CallbackQueryHandler = None
+CommandHandler = None
+ContextTypes = None
+MessageHandler = None
+filters = None
+
+def _lazy_imports():
+    """Lazy load heavy imports to improve startup time"""
+    global asyncpg, nest_asyncio, load_dotenv
+    global BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, ChatAction
+    global ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+    
+    if asyncpg is None:
+        import asyncpg
+        import nest_asyncio
+        from dotenv import load_dotenv
+        from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, Message
+        from telegram.constants import ChatAction
+        from telegram.ext import (
+            ApplicationBuilder,
+            CallbackQueryHandler,
+            CommandHandler,
+            ContextTypes,
+            MessageHandler,
+            filters,
+        )
 
 # Color codes for logging
 class Colors:
@@ -53,24 +78,27 @@ class ColoredFormatter(logging.Formatter):
 
         return colored_format
 
-# Configure logging with colors
+# Configure optimized logging with colors
 def setup_colored_logging():
-    """Setup colored logging configuration"""
+    """Setup optimized colored logging configuration"""
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
+    
+    # Use environment variable to control log level for performance
+    log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
+    logger.setLevel(getattr(logging, log_level, logging.INFO))
 
     # Remove existing handlers
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
 
-    # Create console handler
+    # Create console handler with optimized settings
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.DEBUG)
 
-    # Create colored formatter with enhanced format
+    # Create colored formatter with optimized format
     formatter = ColoredFormatter(
-        fmt='%(asctime)s - %(name)s - [%(levelname)s] - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        fmt='%(asctime)s - [%(levelname)s] - %(message)s',  # Simplified format
+        datefmt='%H:%M:%S'  # Shorter date format
     )
     console_handler.setFormatter(formatter)
 
@@ -125,6 +153,7 @@ def log_with_user_info(level: str, message: str, user_info: Dict[str, any]) -> N
         logger.info(full_message)
 
 # Initialize
+_lazy_imports()
 nest_asyncio.apply()
 load_dotenv()
 
@@ -146,11 +175,56 @@ if not DATABASE_URL:
 logger.info(f"🗄️ Using PostgreSQL database")
 logger.info(f"📁 Backup data file: {DATA_FILE}")
 
-# Global database pool
+# Global database pool and prepared statements
 db_pool = None
+prepared_statements = {}
 
-# Message dictionaries
-START_MESSAGE = [
+# Simple in-memory cache for frequently accessed data
+_cache = {
+    'afk_status': {},  # Cache AFK statuses
+    'last_seen': {},   # Cache last seen timestamps
+    'cache_time': {}   # Track cache timestamps
+}
+CACHE_TTL = 300  # 5 minutes cache TTL
+
+# Performance metrics
+_performance_metrics = {
+    'db_queries': 0,
+    'cache_hits': 0,
+    'cache_misses': 0,
+    'messages_processed': 0,
+    'afk_operations': 0,
+    'start_time': None
+}
+
+def _increment_metric(metric_name: str):
+    """Increment a performance metric"""
+    if metric_name in _performance_metrics:
+        _performance_metrics[metric_name] += 1
+
+def _get_performance_stats() -> Dict[str, Any]:
+    """Get current performance statistics"""
+    uptime = 0
+    if _performance_metrics['start_time']:
+        uptime = (datetime.now(timezone.utc) - _performance_metrics['start_time']).total_seconds()
+    
+    cache_hit_rate = 0
+    total_cache_requests = _performance_metrics['cache_hits'] + _performance_metrics['cache_misses']
+    if total_cache_requests > 0:
+        cache_hit_rate = (_performance_metrics['cache_hits'] / total_cache_requests) * 100
+    
+    return {
+        'uptime_seconds': uptime,
+        'db_queries': _performance_metrics['db_queries'],
+        'cache_hits': _performance_metrics['cache_hits'],
+        'cache_misses': _performance_metrics['cache_misses'],
+        'cache_hit_rate': round(cache_hit_rate, 2),
+        'messages_processed': _performance_metrics['messages_processed'],
+        'afk_operations': _performance_metrics['afk_operations']
+    }
+
+# Optimized message dictionaries using tuples for memory efficiency
+START_MESSAGE = (
     "👋 Hello, {user}!",
     "I'm your friendly <b>AFK Assistant Bot</b> 🤖.",
     "",
@@ -161,9 +235,9 @@ START_MESSAGE = [
     "⏰ I'll also mark you AFK if you're inactive for a while.",
     "",
     "<i>Stay active, stay awesome!</i> ✨"
-]
+)
 
-AFK_MESSAGES = [
+AFK_MESSAGES = (
     "{user} is now AFK: {reason}",
     "{user} has gone AFK: {reason}",
     "{user} is away: {reason}",
@@ -172,9 +246,9 @@ AFK_MESSAGES = [
     "{user} is currently unavailable: {reason}",
     "{user} has left the chat temporarily: {reason}",
     "{user} is offline: {reason}"
-]
+)
 
-BACK_MESSAGES = [
+BACK_MESSAGES = (
     "Welcome back {user}! You were AFK for {duration}.",
     "{user} is back! Was away for {duration}.",
     "{user} has returned after being AFK for {duration}.",
@@ -183,9 +257,9 @@ BACK_MESSAGES = [
     "Good to see you back {user}! You were away for {duration}.",
     "{user} has rejoined us after {duration} of AFK time.",
     "Welcome back {user}! Your AFK lasted {duration}."
-]
+)
 
-AFK_STATUS_MESSAGES = [
+AFK_STATUS_MESSAGES = (
     "{user} is currently away: {reason}. Been offline for {duration}",
     "{user} stepped away: {reason}. Inactive for {duration}",
     "{user} is AFK: {reason}. Last seen {duration} ago",
@@ -194,10 +268,39 @@ AFK_STATUS_MESSAGES = [
     "{user} went offline: {reason}. Unavailable for {duration}",
     "{user} is unreachable: {reason}. Missing for {duration}",
     "{user} stepped out: {reason}. Been away for {duration}"
-]
+)
 
 # Global lock for file operations (backup)
 file_lock = threading.Lock()
+
+def _get_cache_key(chat_id: int, user_id: int) -> str:
+    """Generate cache key for user in chat"""
+    return f"{chat_id}:{user_id}"
+
+def _is_cache_valid(key: str) -> bool:
+    """Check if cache entry is still valid"""
+    if key not in _cache['cache_time']:
+        return False
+    return (datetime.now(timezone.utc) - _cache['cache_time'][key]).total_seconds() < CACHE_TTL
+
+def _cache_afk_status(chat_id: int, user_id: int, status: Optional[Dict[str, Any]]):
+    """Cache AFK status"""
+    key = _get_cache_key(chat_id, user_id)
+    _cache['afk_status'][key] = status
+    _cache['cache_time'][key] = datetime.now(timezone.utc)
+
+def _get_cached_afk_status(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """Get cached AFK status if valid"""
+    key = _get_cache_key(chat_id, user_id)
+    if _is_cache_valid(key) and key in _cache['afk_status']:
+        return _cache['afk_status'][key]
+    return None
+
+def _invalidate_afk_cache(chat_id: int, user_id: int):
+    """Invalidate AFK cache for user"""
+    key = _get_cache_key(chat_id, user_id)
+    _cache['afk_status'].pop(key, None)
+    _cache['cache_time'].pop(key, None)
 
 async def init_database():
     """Initialize database connection and create tables"""
@@ -206,8 +309,19 @@ async def init_database():
     logger.info("🔗 Initializing database connection...")
     
     try:
-        # Create connection pool
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        # Create optimized connection pool
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL, 
+            min_size=2,  # Increased minimum for better performance
+            max_size=20,  # Increased maximum for better concurrency
+            max_queries=50000,  # Maximum queries per connection
+            max_inactive_connection_lifetime=300.0,  # 5 minutes
+            command_timeout=60,  # 60 seconds timeout
+            server_settings={
+                'jit': 'off',  # Disable JIT for better performance in this use case
+                'application_name': 'afk_bot'
+            }
+        )
         logger.info("✅ Database connection pool created successfully")
         
         # Create tables if they don't exist
@@ -237,10 +351,15 @@ async def init_database():
                 )
             ''')
             
-            # Create indexes for better performance
+            # Create optimized indexes for better performance
             await conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_afk_status_chat_user 
                 ON afk_status (chat_id, user_id)
+            ''')
+            
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_afk_status_since 
+                ON afk_status (since)
             ''')
             
             await conn.execute('''
@@ -250,14 +369,66 @@ async def init_database():
             
             await conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_last_seen_seen_at 
-                ON last_seen (seen_at)
+                ON last_seen (seen_at DESC)
+            ''')
+            
+            # Create composite index for common queries
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_last_seen_chat_seen_at 
+                ON last_seen (chat_id, seen_at DESC)
             ''')
             
         logger.info("✅ Database tables created/verified successfully")
         
+        # Prepare frequently used statements for better performance
+        await _prepare_statements()
+        
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}")
         raise
+
+async def _prepare_statements():
+    """Prepare frequently used SQL statements for better performance"""
+    global prepared_statements
+    
+    try:
+        async with db_pool.acquire() as conn:
+            # Prepare AFK status queries
+            prepared_statements['set_afk'] = await conn.prepare('''
+                INSERT INTO afk_status (chat_id, user_id, reason, since)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET reason = $3, since = $4, created_at = NOW()
+            ''')
+            
+            prepared_statements['remove_afk'] = await conn.prepare('''
+                DELETE FROM afk_status 
+                WHERE chat_id = $1 AND user_id = $2
+            ''')
+            
+            prepared_statements['get_afk'] = await conn.prepare('''
+                SELECT reason, since FROM afk_status 
+                WHERE chat_id = $1 AND user_id = $2
+            ''')
+            
+            prepared_statements['update_last_seen'] = await conn.prepare('''
+                INSERT INTO last_seen (chat_id, user_id, seen_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET seen_at = $3, updated_at = NOW()
+            ''')
+            
+            prepared_statements['get_all_last_seen'] = await conn.prepare('''
+                SELECT chat_id, user_id, seen_at 
+                FROM last_seen
+                ORDER BY seen_at DESC
+            ''')
+            
+        logger.info("✅ Prepared statements created successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Error preparing statements: {e}")
+        # Continue without prepared statements
 
 async def close_database():
     """Close database connection pool"""
@@ -297,18 +468,27 @@ def save_data(data):
         logger.error(f"❌ Error saving backup data to {DATA_FILE}: {e}")
 
 async def set_afk(chat_id: int, user_id: int, reason: str, since: datetime):
-    """Set user as AFK with database storage"""
+    """Set user as AFK with database storage and caching"""
     logger.debug(f"⏰ Setting AFK for user {user_id} in chat {chat_id} with reason: {reason}")
     
     try:
+        _increment_metric('db_queries')
+        _increment_metric('afk_operations')
         async with db_pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO afk_status (chat_id, user_id, reason, since)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (chat_id, user_id)
-                DO UPDATE SET reason = $3, since = $4, created_at = NOW()
-            ''', chat_id, user_id, reason, since)
+            if 'set_afk' in prepared_statements:
+                await prepared_statements['set_afk'].fetch(chat_id, user_id, reason, since)
+            else:
+                await conn.execute('''
+                    INSERT INTO afk_status (chat_id, user_id, reason, since)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (chat_id, user_id)
+                    DO UPDATE SET reason = $3, since = $4, created_at = NOW()
+                ''', chat_id, user_id, reason, since)
             
+        # Cache the AFK status
+        afk_status = {"reason": reason, "since": since}
+        _cache_afk_status(chat_id, user_id, afk_status)
+        
         logger.info(f"✅ User {user_id} set as AFK in chat {chat_id}")
         
     except Exception as e:
@@ -326,16 +506,24 @@ async def set_afk(chat_id: int, user_id: int, reason: str, since: datetime):
             logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def remove_afk(chat_id: int, user_id: int):
-    """Remove user from AFK status with database storage"""
+    """Remove user from AFK status with database storage and cache invalidation"""
     logger.debug(f"🔄 Removing AFK status for user {user_id} in chat {chat_id}")
     
     try:
+        _increment_metric('db_queries')
+        _increment_metric('afk_operations')
         async with db_pool.acquire() as conn:
-            result = await conn.execute('''
-                DELETE FROM afk_status 
-                WHERE chat_id = $1 AND user_id = $2
-            ''', chat_id, user_id)
+            if 'remove_afk' in prepared_statements:
+                await prepared_statements['remove_afk'].fetch(chat_id, user_id)
+            else:
+                result = await conn.execute('''
+                    DELETE FROM afk_status 
+                    WHERE chat_id = $1 AND user_id = $2
+                ''', chat_id, user_id)
             
+        # Invalidate cache
+        _invalidate_afk_cache(chat_id, user_id)
+        
         logger.info(f"✅ AFK status removed for user {user_id} in chat {chat_id}")
         
     except Exception as e:
@@ -353,24 +541,42 @@ async def remove_afk(chat_id: int, user_id: int):
             logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def get_afk(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    """Get AFK status for user with database storage"""
+    """Get AFK status for user with database storage and caching"""
     logger.debug(f"🔍 Checking AFK status for user {user_id} in chat {chat_id}")
     
+    # Check cache first
+    cached_status = _get_cached_afk_status(chat_id, user_id)
+    if cached_status is not None:
+        _increment_metric('cache_hits')
+        logger.debug(f"✅ Found cached AFK status for user {user_id}")
+        return cached_status
+    else:
+        _increment_metric('cache_misses')
+    
     try:
+        _increment_metric('db_queries')
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow('''
-                SELECT reason, since FROM afk_status 
-                WHERE chat_id = $1 AND user_id = $2
-            ''', chat_id, user_id)
+            if 'get_afk' in prepared_statements:
+                row = await prepared_statements['get_afk'].fetchrow(chat_id, user_id)
+            else:
+                row = await conn.fetchrow('''
+                    SELECT reason, since FROM afk_status 
+                    WHERE chat_id = $1 AND user_id = $2
+                ''', chat_id, user_id)
             
         if not row:
             logger.debug(f"ℹ️ User {user_id} is not AFK in chat {chat_id}")
+            _cache_afk_status(chat_id, user_id, None)
             return None
             
         result = {
             "reason": row["reason"],
             "since": row["since"].replace(tzinfo=timezone.utc)
         }
+        
+        # Cache the result
+        _cache_afk_status(chat_id, user_id, result)
+        
         logger.debug(f"✅ Found AFK status for user {user_id}: {result['reason']}")
         return result
         
@@ -382,10 +588,12 @@ async def get_afk(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
             key = f"{chat_id}:{user_id}"
             entry = data.get("afk", {}).get(key)
             if not entry:
+                _cache_afk_status(chat_id, user_id, None)
                 return None
             entry_copy = entry.copy()
             entry_copy["since"] = datetime.fromisoformat(entry_copy["since"]).replace(tzinfo=timezone.utc)
             logger.warning(f"⚠️ Used backup storage for AFK check user {user_id}")
+            _cache_afk_status(chat_id, user_id, entry_copy)
             return entry_copy
         except Exception as backup_error:
             logger.error(f"❌ Backup storage also failed: {backup_error}")
@@ -396,13 +604,17 @@ async def update_last_seen(chat_id: int, user_id: int, seen_at: datetime):
     logger.debug(f"👁️ Updating last seen for user {user_id} in chat {chat_id}")
     
     try:
+        _increment_metric('db_queries')
         async with db_pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO last_seen (chat_id, user_id, seen_at)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (chat_id, user_id)
-                DO UPDATE SET seen_at = $3, updated_at = NOW()
-            ''', chat_id, user_id, seen_at)
+            if 'update_last_seen' in prepared_statements:
+                await prepared_statements['update_last_seen'].fetch(chat_id, user_id, seen_at)
+            else:
+                await conn.execute('''
+                    INSERT INTO last_seen (chat_id, user_id, seen_at)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (chat_id, user_id)
+                    DO UPDATE SET seen_at = $3, updated_at = NOW()
+                ''', chat_id, user_id, seen_at)
             
     except Exception as e:
         logger.error(f"❌ Error updating last seen for user {user_id}: {e}")
@@ -423,12 +635,16 @@ async def get_all_last_seen() -> List[Dict[str, Any]]:
     logger.debug("📊 Retrieving all last seen records")
     
     try:
+        _increment_metric('db_queries')
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch('''
-                SELECT chat_id, user_id, seen_at 
-                FROM last_seen
-                ORDER BY seen_at DESC
-            ''')
+            if 'get_all_last_seen' in prepared_statements:
+                rows = await prepared_statements['get_all_last_seen'].fetch()
+            else:
+                rows = await conn.fetch('''
+                    SELECT chat_id, user_id, seen_at 
+                    FROM last_seen
+                    ORDER BY seen_at DESC
+                ''')
             
         items = []
         for row in rows:
@@ -628,8 +844,37 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Error in ping command: {e}")
         log_with_user_info("ERROR", f"❌ Error in ping command: {e}", user_info)
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats command for performance monitoring"""
+    user_info = extract_user_info(update.message)
+    log_with_user_info("INFO", "📊 /stats command received", user_info)
+    
+    try:
+        stats = _get_performance_stats()
+        
+        stats_text = f"""📊 <b>Bot Performance Statistics</b>
+
+⏱️ <b>Uptime:</b> {int(stats['uptime_seconds'])} seconds
+🗄️ <b>Database Queries:</b> {stats['db_queries']}
+💾 <b>Cache Hits:</b> {stats['cache_hits']}
+❌ <b>Cache Misses:</b> {stats['cache_misses']}
+📈 <b>Cache Hit Rate:</b> {stats['cache_hit_rate']}%
+💬 <b>Messages Processed:</b> {stats['messages_processed']}
+😴 <b>AFK Operations:</b> {stats['afk_operations']}
+
+<i>Performance optimized for speed and efficiency!</i> 🚀"""
+        
+        await update.message.reply_html(
+            stats_text,
+            reply_markup=create_delete_keyboard()
+        )
+        log_with_user_info("INFO", "✅ Stats message sent successfully", user_info)
+    except Exception as e:
+        logger.error(f"❌ Error in stats command: {e}")
+        log_with_user_info("ERROR", f"❌ Error in stats command: {e}", user_info)
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all incoming messages"""
+    """Optimized handler for all incoming messages"""
     if not update.message:
         return
     
@@ -642,15 +887,39 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         user_info = extract_user_info(update.message)
+        _increment_metric('messages_processed')
         logger.debug(f"💬 Processing message from user")
         
         now = datetime.now(timezone.utc)
-        await update_last_seen(chat_id, user.id, now)
         
-        # Check if user was AFK and auto-return them
-        afk = await get_afk(chat_id, user.id)
-        if afk:
-            delta = now - afk["since"]
+        # Use asyncio.gather for concurrent operations
+        tasks = []
+        
+        # Always update last seen
+        tasks.append(update_last_seen(chat_id, user.id, now))
+        
+        # Check if user was AFK
+        afk_task = get_afk(chat_id, user.id)
+        tasks.append(afk_task)
+        
+        # Check if replying to AFK user
+        reply_afk_task = None
+        if update.message.reply_to_message:
+            replied_user = update.message.reply_to_message.from_user
+            if replied_user and not replied_user.is_bot:
+                reply_afk_task = get_afk(chat_id, replied_user.id)
+                tasks.append(reply_afk_task)
+        
+        # Execute all database operations concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        user_afk = results[1] if len(results) > 1 else None
+        reply_afk = results[2] if len(results) > 2 and reply_afk_task else None
+        
+        # Handle user returning from AFK
+        if user_afk and not isinstance(user_afk, Exception):
+            delta = now - user_afk["since"]
             await remove_afk(chat_id, user.id)
 
             message = random.choice(BACK_MESSAGES).format(
@@ -658,41 +927,41 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 duration=format_afk_time(delta)
             )
 
-            sent_msg = await update.message.reply_html(
+            await update.message.reply_html(
                 message,
                 reply_markup=create_delete_keyboard()
             )
             log_with_user_info("INFO", f"🔄 Auto-returned user from AFK after {format_afk_time(delta)}", user_info)
         
-        # Check if user replied to someone who is AFK
-        if update.message.reply_to_message:
+        # Handle reply to AFK user
+        if reply_afk and not isinstance(reply_afk, Exception) and update.message.reply_to_message:
             replied_user = update.message.reply_to_message.from_user
-            if replied_user:
-                logger.debug(f"📤 Message is a reply to user {replied_user.id}")
-                afk = await get_afk(chat_id, replied_user.id)
-                if afk:
-                    delta = now - afk["since"]
+            delta = now - reply_afk["since"]
 
-                    message = random.choice(AFK_STATUS_MESSAGES).format(
-                        user=replied_user.mention_html(),
-                        reason=afk['reason'],
-                        duration=format_afk_time(delta)
-                    )
+            message = random.choice(AFK_STATUS_MESSAGES).format(
+                user=replied_user.mention_html(),
+                reason=reply_afk['reason'],
+                duration=format_afk_time(delta)
+            )
 
-                    sent_msg = await update.message.reply_html(
-                        message,
-                        reply_markup=create_delete_keyboard()
-                    )
-                    log_with_user_info("INFO", f"ℹ️ Notified about AFK user: {replied_user.full_name}", user_info)
+            await update.message.reply_html(
+                message,
+                reply_markup=create_delete_keyboard()
+            )
+            log_with_user_info("INFO", f"ℹ️ Notified about AFK user: {replied_user.full_name}", user_info)
+            
     except Exception as e:
         logger.error(f"❌ Error in message handler: {e}")
 
 async def check_inactivity():
-    """Background task to check for inactive users and set them AFK"""
-    logger.info("⏰ Starting inactivity checker task")
+    """Optimized background task to check for inactive users and set them AFK"""
+    logger.info("⏰ Starting optimized inactivity checker task")
     await asyncio.sleep(10)  # Initial delay
     
     check_count = 0
+    batch_size = 50  # Process users in batches for better performance
+    inactivity_threshold = timedelta(minutes=60)
+    
     while True:
         try:
             check_count += 1
@@ -702,17 +971,24 @@ async def check_inactivity():
             records = await get_all_last_seen()
             
             inactive_users = 0
-            for record in records:
-                chat_id = record["chat_id"]
-                user_id = record["user_id"]
-                last_time = record["seen_at"]
-                inactive_time = now - last_time
+            # Process records in batches to avoid memory issues
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i + batch_size]
                 
-                afk = await get_afk(chat_id, user_id)
-                if inactive_time > timedelta(minutes=60) and not afk:
-                    await set_afk(chat_id, user_id, "No activity", last_time)
-                    inactive_users += 1
-                    logger.info(f"😴 Auto-set user {user_id} as AFK due to {format_afk_time(inactive_time)} of inactivity")
+                # Use asyncio.gather for concurrent processing
+                tasks = []
+                for record in batch:
+                    chat_id = record["chat_id"]
+                    user_id = record["user_id"]
+                    last_time = record["seen_at"]
+                    inactive_time = now - last_time
+                    
+                    if inactive_time > inactivity_threshold:
+                        tasks.append(_check_and_set_afk(chat_id, user_id, last_time, inactive_time))
+                
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    inactive_users += sum(1 for result in results if result is True)
             
             if check_count % 10 == 0:  # Log summary every 10 checks
                 logger.info(f"📊 Inactivity check #{check_count}: {len(records)} users monitored, {inactive_users} set as AFK")
@@ -722,9 +998,25 @@ async def check_inactivity():
         
         await asyncio.sleep(60)  # Check every minute
 
+async def _check_and_set_afk(chat_id: int, user_id: int, last_time: datetime, inactive_time: timedelta) -> bool:
+    """Helper function to check and set AFK status for a single user"""
+    try:
+        afk = await get_afk(chat_id, user_id)
+        if not afk:
+            await set_afk(chat_id, user_id, "No activity", last_time)
+            logger.info(f"😴 Auto-set user {user_id} as AFK due to {format_afk_time(inactive_time)} of inactivity")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error checking AFK for user {user_id}: {e}")
+        return False
+
 async def main():
     """Main bot function"""
     logger.info("🤖 Starting main bot function")
+    
+    # Initialize performance metrics
+    _performance_metrics['start_time'] = datetime.now(timezone.utc)
     
     try:
         # Initialize database first
@@ -738,6 +1030,7 @@ async def main():
             BotCommand("start", "Start bot and see help"),
             BotCommand("afk", "Set yourself AFK"),
             BotCommand("back", "Return from AFK"),
+            BotCommand("stats", "View bot performance statistics"),
         ]
         
         await app.bot.set_my_commands(commands)
@@ -747,6 +1040,7 @@ async def main():
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("afk", afk_command))
         app.add_handler(CommandHandler("back", back_command))
+        app.add_handler(CommandHandler("stats", stats_command))
         app.add_handler(CommandHandler("ping", ping_command))  # Hidden command
         app.add_handler(CallbackQueryHandler(delete_callback, pattern="delete_message"))
         app.add_handler(MessageHandler(filters.ALL, message_handler))

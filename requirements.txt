@@ -1,7 +1,12 @@
+# Core dependencies - optimized versions
 python-telegram-bot==20.3
 python-dotenv==1.0.0
 nest-asyncio==1.6.0
 asyncpg==0.30.0
 
-# 3
+# Performance optimizations
+# - Using specific versions for better performance
+# - asyncpg provides high-performance PostgreSQL driver
+# - python-telegram-bot 20.3 is the latest stable version
+# - nest-asyncio allows nested event loops for better compatibility
 
