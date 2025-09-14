@@ -505,6 +505,16 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("💬 Failed to delete message!", show_alert=True)
         log_with_user_info("ERROR", f"❌ Failed to delete message: {e}", user_info)
 
+
+async def delete_message_after_delay(message: Message, delay: int):
+    """Delete a message after a specified delay."""
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+        logger.info(f"🗑️ Automatically deleted message {message.message_id} after {delay} seconds.")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not auto-delete message {message.message_id}: {e}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user_info = extract_user_info(update.message)
@@ -558,6 +568,7 @@ async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message,
             reply_markup=create_delete_keyboard()
         )
+        asyncio.create_task(delete_message_after_delay(sent_msg, 60))
         
         log_with_user_info("INFO", f"✅ AFK status set successfully", user_info)
     except Exception as e:
@@ -587,12 +598,14 @@ async def back_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message,
                 reply_markup=create_delete_keyboard()
             )
+            asyncio.create_task(delete_message_after_delay(sent_msg, 60))
             log_with_user_info("INFO", f"✅ User returned from AFK after {format_afk_time(delta)}", user_info)
         else:
             sent_msg = await update.message.reply_text(
                 "You are not AFK.",
                 reply_markup=create_delete_keyboard()
             )
+            asyncio.create_task(delete_message_after_delay(sent_msg, 60))
             log_with_user_info("INFO", "ℹ️ User tried /back but was not AFK", user_info)
     except Exception as e:
         logger.error(f"❌ Error in back command: {e}")
@@ -662,6 +675,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message,
                 reply_markup=create_delete_keyboard()
             )
+            asyncio.create_task(delete_message_after_delay(sent_msg, 60))
             log_with_user_info("INFO", f"🔄 Auto-returned user from AFK after {format_afk_time(delta)}", user_info)
         
         # Check if user replied to someone who is AFK
@@ -683,6 +697,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         message,
                         reply_markup=create_delete_keyboard()
                     )
+                    asyncio.create_task(delete_message_after_delay(sent_msg, 60))
                     log_with_user_info("INFO", f"ℹ️ Notified about AFK user: {replied_user.full_name}", user_info)
     except Exception as e:
         logger.error(f"❌ Error in message handler: {e}")
