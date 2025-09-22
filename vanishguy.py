@@ -24,10 +24,17 @@ from telegram.ext import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-import uvloop
 
-# Use uvloop for better performance
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# IMPORTANT: Apply nest_asyncio BEFORE setting uvloop policy
+nest_asyncio.apply()
+
+try:
+    import uvloop
+    # Use uvloop for better performance (only if available)
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    # Fall back to default event loop if uvloop is not available
+    pass
 
 # Color codes for logging
 class Colors:
@@ -124,7 +131,6 @@ def setup_colored_logging():
 logger = setup_colored_logging()
 
 # Initialize
-nest_asyncio.apply()
 load_dotenv()
 
 # Configuration
@@ -315,21 +321,18 @@ async def init_database():
                 )
             ''')
             
-            # Create optimized indexes
-            await conn.execute('''
-                CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_afk_chat_user 
-                ON afk_status (chat_id, user_id)
-            ''')
+            # Create optimized indexes (handle errors gracefully)
+            indexes = [
+                'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_afk_chat_user ON afk_status (chat_id, user_id)',
+                'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_last_seen_chat_user ON last_seen (chat_id, user_id)',
+                'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_last_seen_at ON last_seen (seen_at DESC)'
+            ]
             
-            await conn.execute('''
-                CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_last_seen_chat_user 
-                ON last_seen (chat_id, user_id)
-            ''')
-            
-            await conn.execute('''
-                CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_last_seen_at 
-                ON last_seen (seen_at DESC)
-            ''')
+            for index_sql in indexes:
+                try:
+                    await conn.execute(index_sql)
+                except Exception as idx_error:
+                    logger.warning(f"⚠️ Index creation warning: {idx_error}")
             
         logger.info("✅ Database initialized")
         
@@ -458,7 +461,11 @@ async def update_last_seen(chat_id: int, user_id: int, seen_at: datetime):
     await last_seen_cache.set(cache_key, seen_at)
     
     # Queue for batch processing
-    await message_queue.put(('last_seen', (chat_id, user_id, seen_at)))
+    try:
+        await message_queue.put(('last_seen', (chat_id, user_id, seen_at)))
+    except asyncio.QueueFull:
+        # Drop update if queue is full
+        pass
 
 async def get_all_last_seen() -> List[Dict[str, Any]]:
     """Get all last seen records efficiently"""
@@ -509,7 +516,6 @@ def create_delete_keyboard():
 # Message processors
 async def process_message_queue():
     """Process message queue in batches"""
-    batch = []
     last_seen_batch = []
     
     while True:
@@ -517,7 +523,7 @@ async def process_message_queue():
             # Collect messages for batch processing
             deadline = asyncio.create_task(asyncio.sleep(0.5))
             
-            while len(batch) < 50:  # Max batch size
+            while len(last_seen_batch) < 50:  # Max batch size
                 try:
                     msg_task = asyncio.create_task(message_queue.get())
                     done, pending = await asyncio.wait(
@@ -624,7 +630,10 @@ async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # Queue for deletion
-    await deletion_queue.put((sent_msg, 60))
+    try:
+        await deletion_queue.put((sent_msg, 60))
+    except asyncio.QueueFull:
+        pass
 
 async def back_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /back command"""
@@ -651,7 +660,10 @@ async def back_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=create_delete_keyboard()
     )
     
-    await deletion_queue.put((sent_msg, 60))
+    try:
+        await deletion_queue.put((sent_msg, 60))
+    except asyncio.QueueFull:
+        pass
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /ping command"""
@@ -706,7 +718,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=create_delete_keyboard()
         )
         
-        await deletion_queue.put((sent_msg, 60))
+        try:
+            await deletion_queue.put((sent_msg, 60))
+        except asyncio.QueueFull:
+            pass
     
     # Check replies to AFK users
     if update.message.reply_to_message:
@@ -727,7 +742,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=create_delete_keyboard()
                 )
                 
-                await deletion_queue.put((sent_msg, 60))
+                try:
+                    await deletion_queue.put((sent_msg, 60))
+                except asyncio.QueueFull:
+                    pass
 
 async def check_inactivity():
     """Check for inactive users efficiently"""
@@ -767,9 +785,12 @@ async def cache_cleaner():
     """Periodically clean expired cache entries"""
     while True:
         await asyncio.sleep(300)  # Every 5 minutes
-        await afk_cache.clear_expired()
-        await last_seen_cache.clear_expired()
-        await user_info_cache.clear_expired()
+        try:
+            await afk_cache.clear_expired()
+            await last_seen_cache.clear_expired()
+            await user_info_cache.clear_expired()
+        except Exception as e:
+            logger.error(f"❌ Cache cleaner error: {e}")
 
 # Web server for health checks
 async def health_check(request):
@@ -778,18 +799,21 @@ async def health_check(request):
 
 async def start_web_server():
     """Start async web server"""
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    logger.info(f"🌐 Web server started on port {port}")
+    try:
+        app = web.Application()
+        app.router.add_get('/', health_check)
+        app.router.add_get('/health', health_check)
+        
+        port = int(os.environ.get("PORT", 10000))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        logger.info(f"🌐 Web server started on port {port}")
+    except Exception as e:
+        logger.error(f"❌ Web server error: {e}")
 
 async def main():
     """Main bot function with full async"""
@@ -797,6 +821,9 @@ async def main():
     
     # Start async logger
     await async_handler.start()
+    
+    # Initialize tasks list
+    tasks = []
     
     try:
         # Initialize database
@@ -810,6 +837,7 @@ async def main():
             BotCommand("start", "Start bot and see help"),
             BotCommand("afk", "Set yourself AFK"),
             BotCommand("back", "Return from AFK"),
+            BotCommand("ping", "Check bot response time"),
         ]
         
         await app.bot.set_my_commands(commands)
@@ -841,10 +869,15 @@ async def main():
         raise
     finally:
         # Cleanup
-        for task in tasks:
-            task.cancel()
+        logger.info("🧹 Cleaning up...")
         
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
         await close_database()
         await async_handler.stop()
         executor.shutdown(wait=False)
