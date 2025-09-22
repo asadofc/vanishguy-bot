@@ -6,11 +6,10 @@ import asyncio
 import asyncpg
 import nest_asyncio
 import logging
-import aiofiles
-import aiohttp
+import threading
 from datetime import datetime, timezone, timedelta
-from aiohttp import web
-from typing import Dict, Optional, List, Any, Set
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict, Optional, List, Any
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, Message
 from telegram.constants import ChatAction
@@ -22,31 +21,19 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-
-# IMPORTANT: Apply nest_asyncio BEFORE setting uvloop policy
-nest_asyncio.apply()
-
-try:
-    import uvloop
-    # Use uvloop for better performance (only if available)
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except ImportError:
-    # Fall back to default event loop if uvloop is not available
-    pass
 
 # Color codes for logging
 class Colors:
-    BLUE = '\033[94m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
+    BLUE = '\033[94m'      # INFO/WARNING
+    GREEN = '\033[92m'     # DEBUG
+    YELLOW = '\033[93m'    # INFO
+    RED = '\033[91m'       # ERROR
+    RESET = '\033[0m'      # Reset color
+    BOLD = '\033[1m'       # Bold text
 
 class ColoredFormatter(logging.Formatter):
-    """Custom formatter with color support"""
+    """Custom formatter to add colors to entire log messages"""
+
     COLORS = {
         'DEBUG': Colors.GREEN,
         'INFO': Colors.YELLOW,
@@ -55,83 +42,93 @@ class ColoredFormatter(logging.Formatter):
     }
 
     def format(self, record):
+        # Get the original formatted message
         original_format = super().format(record)
+
+        # Get color based on log level
         color = self.COLORS.get(record.levelname, Colors.RESET)
-        return f"{color}{original_format}{Colors.RESET}"
 
-# Async logging handler
-class AsyncLogHandler(logging.Handler):
-    """Asynchronous logging handler using queue"""
-    def __init__(self):
-        super().__init__()
-        self.queue = asyncio.Queue(maxsize=10000)
-        self.task = None
+        # Apply color to the entire message
+        colored_format = f"{color}{original_format}{Colors.RESET}"
 
-    async def start(self):
-        """Start the async log processor"""
-        self.task = asyncio.create_task(self._process_logs())
+        return colored_format
 
-    async def stop(self):
-        """Stop the async log processor"""
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-
-    async def _process_logs(self):
-        """Process logs from queue asynchronously"""
-        while True:
-            try:
-                record = await self.queue.get()
-                if record:
-                    self._emit(record)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
-
-    def emit(self, record):
-        """Queue log record for async processing"""
-        try:
-            self.queue.put_nowait(record)
-        except asyncio.QueueFull:
-            # Drop log if queue is full (non-blocking)
-            pass
-
-    def _emit(self, record):
-        """Actually emit the log record"""
-        try:
-            msg = self.format(record)
-            print(msg)
-        except Exception:
-            self.handleError(record)
-
-# Configure async logging
-async_handler = AsyncLogHandler()
-
+# Configure logging with colors
 def setup_colored_logging():
-    """Setup colored async logging"""
+    """Setup colored logging configuration"""
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
-    
+
+    # Remove existing handlers
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
-    
+
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+
+    # Create colored formatter with enhanced format
     formatter = ColoredFormatter(
         fmt='%(asctime)s - %(name)s - [%(levelname)s] - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    async_handler.setFormatter(formatter)
-    logger.addHandler(async_handler)
-    
+    console_handler.setFormatter(formatter)
+
+    # Add handler to logger
+    logger.addHandler(console_handler)
+
     return logger
 
+# Initialize colored logger
 logger = setup_colored_logging()
 
+def extract_user_info(msg: Message) -> Dict[str, any]:
+    """Extract user and chat information from message"""
+    logger.debug("🔍 Extracting user information from message")
+    u = msg.from_user
+    c = msg.chat
+    info = {
+        "user_id": u.id,
+        "username": u.username,
+        "full_name": u.full_name,
+        "chat_id": c.id,
+        "chat_type": c.type,
+        "chat_title": c.title or c.first_name or "",
+        "chat_username": f"@{c.username}" if c.username else "No Username",
+        "chat_link": f"https://t.me/{c.username}" if c.username else "No Link",
+    }
+    logger.info(
+        f"📑 User info extracted: {info['full_name']} (@{info['username']}) "
+        f"[ID: {info['user_id']}] in {info['chat_title']} [{info['chat_id']}] {info['chat_link']}"
+    )
+    return info
+
+def log_with_user_info(level: str, message: str, user_info: Dict[str, any]) -> None:
+    """Log message with user information"""
+    user_detail = (
+        f"👤 {user_info['full_name']} (@{user_info['username']}) "
+        f"[ID: {user_info['user_id']}] | "
+        f"💬 {user_info['chat_title']} [{user_info['chat_id']}] "
+        f"({user_info['chat_type']}) {user_info['chat_link']}"
+    )
+    full_message = f"{message} | {user_detail}"
+
+    if level.upper() == "INFO":
+        logger.info(full_message)
+    elif level.upper() == "DEBUG":
+        logger.debug(full_message)
+    elif level.upper() == "WARNING":
+        logger.warning(full_message)
+    elif level.upper() == "ERROR":
+        logger.error(full_message)
+    else:
+        logger.info(full_message)
+
 # Initialize
+nest_asyncio.apply()
 load_dotenv()
+
+logger.info("🚀 Starting AFK Bot initialization...")
 
 # Configuration
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -139,95 +136,20 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
 if not TOKEN:
-    logger.error("❌ BOT_TOKEN not found!")
+    logger.error("❌ BOT_TOKEN not found in environment variables!")
     exit(1)
 
 if not DATABASE_URL:
-    logger.error("❌ DATABASE_URL not found!")
+    logger.error("❌ DATABASE_URL not found in environment variables!")
     exit(1)
 
-# Connection pools and caches
+logger.info(f"🗄️ Using PostgreSQL database")
+logger.info(f"📁 Backup data file: {DATA_FILE}")
+
+# Global database pool
 db_pool = None
-redis_pool = None  # Optional Redis for caching
-executor = ThreadPoolExecutor(max_workers=4)
 
-# In-memory caches with TTL
-class AsyncCache:
-    """Async TTL cache implementation"""
-    def __init__(self, ttl_seconds=300):
-        self.cache = {}
-        self.ttl = ttl_seconds
-        self.lock = asyncio.Lock()
-
-    async def get(self, key):
-        async with self.lock:
-            if key in self.cache:
-                value, timestamp = self.cache[key]
-                if time.time() - timestamp < self.ttl:
-                    return value
-                else:
-                    del self.cache[key]
-            return None
-
-    async def set(self, key, value):
-        async with self.lock:
-            self.cache[key] = (value, time.time())
-
-    async def delete(self, key):
-        async with self.lock:
-            if key in self.cache:
-                del self.cache[key]
-
-    async def clear_expired(self):
-        """Clear expired cache entries"""
-        async with self.lock:
-            current_time = time.time()
-            expired_keys = [
-                key for key, (_, timestamp) in self.cache.items()
-                if current_time - timestamp >= self.ttl
-            ]
-            for key in expired_keys:
-                del self.cache[key]
-
-# Initialize caches
-afk_cache = AsyncCache(ttl_seconds=60)
-last_seen_cache = AsyncCache(ttl_seconds=30)
-user_info_cache = AsyncCache(ttl_seconds=300)
-
-# Message rate limiter
-class AsyncRateLimiter:
-    """Async rate limiter for message handling"""
-    def __init__(self, rate=10, per=1.0):
-        self.rate = rate
-        self.per = per
-        self.allowance = rate
-        self.last_check = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def is_allowed(self):
-        async with self.lock:
-            current = time.monotonic()
-            time_passed = current - self.last_check
-            self.last_check = current
-            self.allowance += time_passed * (self.rate / self.per)
-            
-            if self.allowance > self.rate:
-                self.allowance = self.rate
-            
-            if self.allowance < 1.0:
-                return False
-            
-            self.allowance -= 1.0
-            return True
-
-# Rate limiters per user
-user_rate_limiters = {}
-
-# Message queues
-message_queue = asyncio.Queue(maxsize=1000)
-deletion_queue = asyncio.Queue(maxsize=500)
-
-# Messages
+# Message dictionaries
 START_MESSAGE = [
     "👋 Hello, {user}!",
     "I'm your friendly <b>AFK Assistant Bot</b> 🤖.",
@@ -245,59 +167,52 @@ AFK_MESSAGES = [
     "{user} is now AFK: {reason}",
     "{user} has gone AFK: {reason}",
     "{user} is away: {reason}",
-    "{user} stepped away: {reason}"
+    "{user} stepped away: {reason}",
+    "{user} is taking a break: {reason}",
+    "{user} is currently unavailable: {reason}",
+    "{user} has left the chat temporarily: {reason}",
+    "{user} is offline: {reason}"
 ]
 
 BACK_MESSAGES = [
     "Welcome back {user}! You were AFK for {duration}.",
     "{user} is back! Was away for {duration}.",
-    "{user} has returned after being AFK for {duration}."
+    "{user} has returned after being AFK for {duration}.",
+    "Hey {user}! You're back after {duration} of being away.",
+    "{user} is online again! Was AFK for {duration}.",
+    "Good to see you back {user}! You were away for {duration}.",
+    "{user} has rejoined us after {duration} of AFK time.",
+    "Welcome back {user}! Your AFK lasted {duration}."
 ]
 
 AFK_STATUS_MESSAGES = [
     "{user} is currently away: {reason}. Been offline for {duration}",
     "{user} stepped away: {reason}. Inactive for {duration}",
-    "{user} is AFK: {reason}. Last seen {duration} ago"
+    "{user} is AFK: {reason}. Last seen {duration} ago",
+    "{user} left temporarily: {reason}. Away for {duration}",
+    "{user} is taking time off: {reason}. Been gone for {duration}",
+    "{user} went offline: {reason}. Unavailable for {duration}",
+    "{user} is unreachable: {reason}. Missing for {duration}",
+    "{user} stepped out: {reason}. Been away for {duration}"
 ]
 
-# Utility functions
-def extract_user_info(msg: Message) -> Dict[str, any]:
-    """Extract user info (synchronous, fast)"""
-    u = msg.from_user
-    c = msg.chat
-    return {
-        "user_id": u.id,
-        "username": u.username,
-        "full_name": u.full_name,
-        "chat_id": c.id,
-        "chat_type": c.type,
-        "chat_title": c.title or c.first_name or "",
-        "chat_username": f"@{c.username}" if c.username else "No Username",
-        "chat_link": f"https://t.me/{c.username}" if c.username else "No Link",
-    }
+# Global lock for file operations (backup)
+file_lock = threading.Lock()
 
 async def init_database():
-    """Initialize database with connection pooling"""
+    """Initialize database connection and create tables"""
     global db_pool
     
-    logger.info("🔗 Initializing database...")
+    logger.info("🔗 Initializing database connection...")
     
     try:
-        # Create connection pool with optimized settings
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=5,
-            max_size=20,
-            max_queries=50000,
-            max_inactive_connection_lifetime=300,
-            command_timeout=10,
-            statement_cache_size=0  # Disable for better memory usage
-        )
+        # Create connection pool
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        logger.info("✅ Database connection pool created successfully")
         
-        logger.info("✅ Database pool created")
-        
-        # Create tables with proper indexes
+        # Create tables if they don't exist
         async with db_pool.acquire() as conn:
+            # AFK status table
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS afk_status (
                     id SERIAL PRIMARY KEY,
@@ -310,6 +225,7 @@ async def init_database():
                 )
             ''')
             
+            # Last seen table
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS last_seen (
                     id SERIAL PRIMARY KEY,
@@ -321,572 +237,593 @@ async def init_database():
                 )
             ''')
             
-            # Create optimized indexes (handle errors gracefully)
-            indexes = [
-                'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_afk_chat_user ON afk_status (chat_id, user_id)',
-                'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_last_seen_chat_user ON last_seen (chat_id, user_id)',
-                'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_last_seen_at ON last_seen (seen_at DESC)'
-            ]
+            # Create indexes for better performance
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_afk_status_chat_user 
+                ON afk_status (chat_id, user_id)
+            ''')
             
-            for index_sql in indexes:
-                try:
-                    await conn.execute(index_sql)
-                except Exception as idx_error:
-                    logger.warning(f"⚠️ Index creation warning: {idx_error}")
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_last_seen_chat_user 
+                ON last_seen (chat_id, user_id)
+            ''')
             
-        logger.info("✅ Database initialized")
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_last_seen_seen_at 
+                ON last_seen (seen_at)
+            ''')
+            
+        logger.info("✅ Database tables created/verified successfully")
         
     except Exception as e:
-        logger.error(f"❌ Database init failed: {e}")
+        logger.error(f"❌ Database initialization failed: {e}")
         raise
 
 async def close_database():
-    """Close database pool"""
+    """Close database connection pool"""
     global db_pool
+    
     if db_pool:
         await db_pool.close()
-        logger.info("🔌 Database closed")
+        logger.info("🔌 Database connection pool closed")
 
-# Async file operations
-async def load_data():
-    """Load data asynchronously"""
+# Backup functions (keeping JSON as fallback)
+def load_data():
+    """Load data from JSON file with error handling (backup only)"""
+    logger.debug(f"📂 Loading backup data from {DATA_FILE}")
     try:
         if not os.path.exists(DATA_FILE):
+            logger.warning(f"⚠️ Backup data file {DATA_FILE} not found, creating new one")
             default_data = {"leaderboard": {}, "afk": {}, "last_seen": {}}
-            await save_data(default_data)
+            save_data(default_data)
             return default_data
         
-        async with aiofiles.open(DATA_FILE, 'r') as f:
-            content = await f.read()
-            return json.loads(content)
+        with open(DATA_FILE, "r") as f:
+            data = json.load(f)
+            logger.debug(f"✅ Successfully loaded backup data")
+            return data
     except Exception as e:
-        logger.error(f"❌ Error loading data: {e}")
+        logger.error(f"❌ Error loading backup data: {e}")
         return {"leaderboard": {}, "afk": {}, "last_seen": {}}
 
-async def save_data(data):
-    """Save data asynchronously"""
+def save_data(data):
+    """Save data to JSON file with error handling (backup only)"""
+    logger.debug(f"💾 Saving backup data to {DATA_FILE}")
     try:
-        async with aiofiles.open(DATA_FILE, 'w') as f:
-            await f.write(json.dumps(data, indent=4))
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+        logger.debug("✅ Backup data saved successfully")
     except Exception as e:
-        logger.error(f"❌ Error saving data: {e}")
+        logger.error(f"❌ Error saving backup data to {DATA_FILE}: {e}")
 
-# Database operations with caching
 async def set_afk(chat_id: int, user_id: int, reason: str, since: datetime):
-    """Set AFK status with caching"""
-    cache_key = f"{chat_id}:{user_id}"
+    """Set user as AFK with database storage"""
+    logger.debug(f"⏰ Setting AFK for user {user_id} in chat {chat_id} with reason: {reason}")
     
-    # Update cache immediately
-    await afk_cache.set(cache_key, {"reason": reason, "since": since})
-    
-    # Database update (non-blocking)
     try:
         async with db_pool.acquire() as conn:
             await conn.execute('''
                 INSERT INTO afk_status (chat_id, user_id, reason, since)
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (chat_id, user_id)
-                DO UPDATE SET reason = $3, since = $4
+                DO UPDATE SET reason = $3, since = $4, created_at = NOW()
             ''', chat_id, user_id, reason, since)
+            
+        logger.info(f"✅ User {user_id} set as AFK in chat {chat_id}")
+        
     except Exception as e:
-        logger.error(f"❌ DB error setting AFK: {e}")
+        logger.error(f"❌ Error setting AFK for user {user_id}: {e}")
+        # Try backup method
+        try:
+            with file_lock:
+                data = load_data()
+                data.setdefault("afk", {})
+                key = f"{chat_id}:{user_id}"
+                data["afk"][key] = {"reason": reason, "since": since.isoformat()}
+                save_data(data)
+                logger.warning(f"⚠️ Used backup storage for AFK user {user_id}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def remove_afk(chat_id: int, user_id: int):
-    """Remove AFK status with cache invalidation"""
-    cache_key = f"{chat_id}:{user_id}"
+    """Remove user from AFK status with database storage"""
+    logger.debug(f"🔄 Removing AFK status for user {user_id} in chat {chat_id}")
     
-    # Clear cache immediately
-    await afk_cache.delete(cache_key)
-    
-    # Database update (non-blocking)
     try:
         async with db_pool.acquire() as conn:
-            await conn.execute('''
+            result = await conn.execute('''
                 DELETE FROM afk_status 
                 WHERE chat_id = $1 AND user_id = $2
             ''', chat_id, user_id)
+            
+        logger.info(f"✅ AFK status removed for user {user_id} in chat {chat_id}")
+        
     except Exception as e:
-        logger.error(f"❌ DB error removing AFK: {e}")
+        logger.error(f"❌ Error removing AFK for user {user_id}: {e}")
+        # Try backup method
+        try:
+            with file_lock:
+                data = load_data()
+                key = f"{chat_id}:{user_id}"
+                if key in data.get("afk", {}):
+                    del data["afk"][key]
+                    save_data(data)
+                    logger.warning(f"⚠️ Used backup storage to remove AFK user {user_id}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def get_afk(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    """Get AFK status with caching"""
-    cache_key = f"{chat_id}:{user_id}"
+    """Get AFK status for user with database storage"""
+    logger.debug(f"🔍 Checking AFK status for user {user_id} in chat {chat_id}")
     
-    # Check cache first
-    cached = await afk_cache.get(cache_key)
-    if cached:
-        return cached
-    
-    # Database lookup
     try:
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow('''
                 SELECT reason, since FROM afk_status 
                 WHERE chat_id = $1 AND user_id = $2
             ''', chat_id, user_id)
-        
-        if row:
-            result = {
-                "reason": row["reason"],
-                "since": row["since"].replace(tzinfo=timezone.utc)
-            }
-            # Update cache
-            await afk_cache.set(cache_key, result)
-            return result
             
+        if not row:
+            logger.debug(f"ℹ️ User {user_id} is not AFK in chat {chat_id}")
+            return None
+            
+        result = {
+            "reason": row["reason"],
+            "since": row["since"].replace(tzinfo=timezone.utc)
+        }
+        logger.debug(f"✅ Found AFK status for user {user_id}: {result['reason']}")
+        return result
+        
     except Exception as e:
-        logger.error(f"❌ DB error getting AFK: {e}")
-    
-    return None
+        logger.error(f"❌ Error getting AFK status for user {user_id}: {e}")
+        # Try backup method
+        try:
+            data = load_data()
+            key = f"{chat_id}:{user_id}"
+            entry = data.get("afk", {}).get(key)
+            if not entry:
+                return None
+            entry_copy = entry.copy()
+            entry_copy["since"] = datetime.fromisoformat(entry_copy["since"]).replace(tzinfo=timezone.utc)
+            logger.warning(f"⚠️ Used backup storage for AFK check user {user_id}")
+            return entry_copy
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
+            return None
 
-async def batch_update_last_seen(updates: List[tuple]):
-    """Batch update last seen timestamps"""
-    if not updates:
-        return
+async def update_last_seen(chat_id: int, user_id: int, seen_at: datetime):
+    """Update last seen timestamp for user with database storage"""
+    logger.debug(f"👁️ Updating last seen for user {user_id} in chat {chat_id}")
     
     try:
         async with db_pool.acquire() as conn:
-            await conn.executemany('''
+            await conn.execute('''
                 INSERT INTO last_seen (chat_id, user_id, seen_at)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (chat_id, user_id)
                 DO UPDATE SET seen_at = $3, updated_at = NOW()
-            ''', updates)
+            ''', chat_id, user_id, seen_at)
+            
     except Exception as e:
-        logger.error(f"❌ Batch update error: {e}")
-
-async def update_last_seen(chat_id: int, user_id: int, seen_at: datetime):
-    """Queue last seen update for batching"""
-    cache_key = f"{chat_id}:{user_id}"
-    await last_seen_cache.set(cache_key, seen_at)
-    
-    # Queue for batch processing
-    try:
-        await message_queue.put(('last_seen', (chat_id, user_id, seen_at)))
-    except asyncio.QueueFull:
-        # Drop update if queue is full
-        pass
+        logger.error(f"❌ Error updating last seen for user {user_id}: {e}")
+        # Try backup method
+        try:
+            with file_lock:
+                data = load_data()
+                data.setdefault("last_seen", {})
+                key = f"{chat_id}:{user_id}"
+                data["last_seen"][key] = seen_at.isoformat()
+                save_data(data)
+                logger.warning(f"⚠️ Used backup storage for last seen user {user_id}")
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
 
 async def get_all_last_seen() -> List[Dict[str, Any]]:
-    """Get all last seen records efficiently"""
+    """Get all last seen records with database storage"""
+    logger.debug("📊 Retrieving all last seen records")
+    
     try:
         async with db_pool.acquire() as conn:
             rows = await conn.fetch('''
                 SELECT chat_id, user_id, seen_at 
                 FROM last_seen
-                WHERE seen_at > NOW() - INTERVAL '2 hours'
                 ORDER BY seen_at DESC
-                LIMIT 1000
             ''')
-        
-        return [
-            {
+            
+        items = []
+        for row in rows:
+            items.append({
                 "chat_id": row["chat_id"],
                 "user_id": row["user_id"],
                 "seen_at": row["seen_at"].replace(tzinfo=timezone.utc)
-            }
-            for row in rows
-        ]
+            })
+            
+        logger.debug(f"✅ Retrieved {len(items)} last seen records from database")
+        return items
+        
     except Exception as e:
-        logger.error(f"❌ Error getting last seen: {e}")
-        return []
+        logger.error(f"❌ Error getting last seen records: {e}")
+        # Try backup method
+        try:
+            data = load_data()
+            items = []
+            for key, iso in data.get("last_seen", {}).items():
+                chat_id, user_id = key.split(":")
+                items.append({
+                    "chat_id": int(chat_id),
+                    "user_id": int(user_id),
+                    "seen_at": datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+                })
+            logger.warning(f"⚠️ Used backup storage for last seen records: {len(items)} records")
+            return items
+        except Exception as backup_error:
+            logger.error(f"❌ Backup storage also failed: {backup_error}")
+            return []
 
 def format_afk_time(delta: timedelta) -> str:
-    """Format time delta efficiently"""
+    """Format time delta into human readable string"""
     seconds = int(delta.total_seconds())
-    
-    if seconds < 60:
-        return f"{seconds} second{'s' if seconds != 1 else ''}"
-    elif seconds < 3600:
-        minutes = seconds // 60
-        return f"{minutes} minute{'s' if minutes != 1 else ''}"
-    elif seconds < 86400:
-        hours = seconds // 3600
-        return f"{hours} hour{'s' if hours != 1 else ''}"
-    else:
-        days = seconds // 86400
-        return f"{days} day{'s' if days != 1 else ''}"
+    years, remainder = divmod(seconds, 31536000)
+    months, remainder = divmod(remainder, 2592000)
+    days, remainder = divmod(remainder, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = []
+    if years > 0:
+        parts.append(f"{years} year{'s' if years != 1 else ''}")
+    if months > 0:
+        parts.append(f"{months} month{'s' if months != 1 else ''}")
+    if days > 0:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes > 0:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if seconds > 0 or not parts:
+        parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+    return " ".join(parts)
 
 def create_delete_keyboard():
-    """Create inline keyboard"""
+    """Create inline keyboard with delete button"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🗑️", callback_data="delete_message")]
     ])
 
-# Message processors
-async def process_message_queue():
-    """Process message queue in batches"""
-    last_seen_batch = []
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle delete button callback"""
+    query = update.callback_query
+    user_info = extract_user_info(query.message)
     
-    while True:
-        try:
-            # Collect messages for batch processing
-            deadline = asyncio.create_task(asyncio.sleep(0.5))
-            
-            while len(last_seen_batch) < 50:  # Max batch size
-                try:
-                    msg_task = asyncio.create_task(message_queue.get())
-                    done, pending = await asyncio.wait(
-                        {msg_task, deadline},
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-                    
-                    if msg_task in done:
-                        msg_type, data = msg_task.result()
-                        if msg_type == 'last_seen':
-                            last_seen_batch.append(data)
-                    else:
-                        msg_task.cancel()
-                        break
-                        
-                except asyncio.TimeoutError:
-                    break
-            
-            # Process batches
-            if last_seen_batch:
-                await batch_update_last_seen(last_seen_batch)
-                last_seen_batch.clear()
-                
-        except Exception as e:
-            logger.error(f"❌ Queue processor error: {e}")
-        
-        await asyncio.sleep(0.1)
+    log_with_user_info("INFO", "🗑️ Delete button pressed", user_info)
 
-async def process_deletion_queue():
-    """Process message deletions asynchronously"""
-    while True:
-        try:
-            message, delay = await deletion_queue.get()
-            asyncio.create_task(delete_message_after_delay(message, delay))
-        except Exception as e:
-            logger.error(f"❌ Deletion queue error: {e}")
-        await asyncio.sleep(0.1)
+    try:
+        await query.message.delete()
+        await query.answer("🗑️ Message deleted!", show_alert=False)
+        log_with_user_info("INFO", "✅ Message successfully deleted", user_info)
+    except Exception as e:
+        logger.error(f"❌ Failed to delete message: {e}")
+        await query.answer("💬 Failed to delete message!", show_alert=True)
+        log_with_user_info("ERROR", f"❌ Failed to delete message: {e}", user_info)
+
 
 async def delete_message_after_delay(message: Message, delay: int):
-    """Delete message after delay"""
+    """Delete a message after a specified delay."""
     await asyncio.sleep(delay)
     try:
         await message.delete()
-    except Exception:
-        pass
-
-# Command handlers
-async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle delete callback"""
-    query = update.callback_query
-    try:
-        await query.message.delete()
-        await query.answer("🗑️ Deleted!", show_alert=False)
-    except Exception:
-        await query.answer("💬 Failed!", show_alert=True)
+        logger.info(f"🗑️ Automatically deleted message {message.message_id} after {delay} seconds.")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not auto-delete message {message.message_id}: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    user = update.effective_user
-    bot_username = context.bot.username
+    user_info = extract_user_info(update.message)
+    log_with_user_info("INFO", "🚀 /start command received", user_info)
     
-    # Send typing action (non-blocking)
-    asyncio.create_task(
-        context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=ChatAction.TYPING
-        )
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Updates", url="https://t.me/WorkGlows"),
-            InlineKeyboardButton("Support", url="https://t.me/SoulMeetsHQ")
-        ],
-        [
-            InlineKeyboardButton(
-                "Add Me To Your Group",
-                url=f"https://t.me/{bot_username}?startgroup=true"
-            )
-        ]
-    ])
-    
-    message_text = "\n".join(START_MESSAGE).format(user=user.mention_html())
-    await update.message.reply_html(message_text, reply_markup=keyboard)
+    try:
+        user = update.effective_user
+        bot_username = context.bot.username
+        
+        logger.debug(f"🤖 Bot username: {bot_username}")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Updates", url="https://t.me/WorkGlows"),
+                InlineKeyboardButton("Support", url="https://t.me/SoulMeetsHQ")
+            ],
+            [
+                InlineKeyboardButton("Add Me To Your Group", url=f"https://t.me/{bot_username}?startgroup=true")
+            ]
+        ])
+
+        message_text = "\n".join(START_MESSAGE).format(user=user.mention_html())
+
+        await update.message.reply_html(message_text, reply_markup=keyboard)
+        log_with_user_info("INFO", "✅ Start message sent successfully", user_info)
+    except Exception as e:
+        logger.error(f"❌ Error in start command: {e}")
+        log_with_user_info("ERROR", f"❌ Error in start command: {e}", user_info)
 
 async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /afk command"""
-    user = update.effective_user
-    chat_id = update.effective_chat.id
+    user_info = extract_user_info(update.message)
     reason = " ".join(context.args) if context.args else "AFK"
-    now = datetime.now(timezone.utc)
     
-    # Set AFK (non-blocking)
-    asyncio.create_task(set_afk(chat_id, user.id, reason, now))
-    
-    message = random.choice(AFK_MESSAGES).format(
-        user=user.mention_html(),
-        reason=reason
-    )
-    
-    sent_msg = await update.message.reply_html(
-        message,
-        reply_markup=create_delete_keyboard()
-    )
-    
-    # Queue for deletion
-    try:
-        await deletion_queue.put((sent_msg, 60))
-    except asyncio.QueueFull:
-        pass
-
-async def back_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /back command"""
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    
-    afk = await get_afk(chat_id, user.id)
-    
-    if afk:
-        delta = datetime.now(timezone.utc) - afk["since"]
-        
-        # Remove AFK (non-blocking)
-        asyncio.create_task(remove_afk(chat_id, user.id))
-        
-        message = random.choice(BACK_MESSAGES).format(
-            user=user.mention_html(),
-            duration=format_afk_time(delta)
-        )
-    else:
-        message = "You are not AFK."
-    
-    sent_msg = await update.message.reply_html(
-        message,
-        reply_markup=create_delete_keyboard()
-    )
+    log_with_user_info("INFO", f"😴 /afk command received with reason: {reason}", user_info)
     
     try:
-        await deletion_queue.put((sent_msg, 60))
-    except asyncio.QueueFull:
-        pass
-
-async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /ping command"""
-    start_time = time.perf_counter()
-    
-    sent_msg = await update.message.reply_text("🛰️ Pinging...")
-    
-    ping_ms = round((time.perf_counter() - start_time) * 1000, 2)
-    
-    await sent_msg.edit_text(
-        f'🏓 <a href="https://t.me/SoulMeetsHQ">Pong!</a> {ping_ms}ms',
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle messages asynchronously"""
-    if not update.message or update.effective_user.is_bot:
-        return
-    
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    user_id = user.id
-    
-    # Rate limiting
-    if user_id not in user_rate_limiters:
-        user_rate_limiters[user_id] = AsyncRateLimiter(rate=30, per=60)
-    
-    if not await user_rate_limiters[user_id].is_allowed():
-        return  # Drop message if rate limited
-    
-    now = datetime.now(timezone.utc)
-    
-    # Update last seen (non-blocking)
-    asyncio.create_task(update_last_seen(chat_id, user_id, now))
-    
-    # Check AFK status
-    afk = await get_afk(chat_id, user_id)
-    if afk:
-        delta = now - afk["since"]
+        user = update.effective_user
+        chat_id = update.effective_chat.id
+        now = datetime.now(timezone.utc)
         
-        # Remove AFK (non-blocking)
-        asyncio.create_task(remove_afk(chat_id, user_id))
-        
-        message = random.choice(BACK_MESSAGES).format(
+        await set_afk(chat_id, user.id, reason, now)
+
+        message = random.choice(AFK_MESSAGES).format(
             user=user.mention_html(),
-            duration=format_afk_time(delta)
+            reason=reason
         )
-        
+
         sent_msg = await update.message.reply_html(
             message,
             reply_markup=create_delete_keyboard()
         )
+        asyncio.create_task(delete_message_after_delay(sent_msg, 60))
         
-        try:
-            await deletion_queue.put((sent_msg, 60))
-        except asyncio.QueueFull:
-            pass
+        log_with_user_info("INFO", f"✅ AFK status set successfully", user_info)
+    except Exception as e:
+        logger.error(f"❌ Error in afk command: {e}")
+        log_with_user_info("ERROR", f"❌ Error in afk command: {e}", user_info)
+
+async def back_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /back command"""
+    user_info = extract_user_info(update.message)
+    log_with_user_info("INFO", "🔙 /back command received", user_info)
     
-    # Check replies to AFK users
-    if update.message.reply_to_message:
-        replied_user = update.message.reply_to_message.from_user
-        if replied_user:
-            afk = await get_afk(chat_id, replied_user.id)
-            if afk:
-                delta = now - afk["since"]
-                
-                message = random.choice(AFK_STATUS_MESSAGES).format(
-                    user=replied_user.mention_html(),
-                    reason=afk['reason'],
-                    duration=format_afk_time(delta)
-                )
-                
-                sent_msg = await update.message.reply_html(
-                    message,
-                    reply_markup=create_delete_keyboard()
-                )
-                
-                try:
-                    await deletion_queue.put((sent_msg, 60))
-                except asyncio.QueueFull:
-                    pass
+    try:
+        user = update.effective_user
+        chat_id = update.effective_chat.id
+        afk = await get_afk(chat_id, user.id)
+        
+        if afk:
+            delta = datetime.now(timezone.utc) - afk["since"]
+            await remove_afk(chat_id, user.id)
+
+            message = random.choice(BACK_MESSAGES).format(
+                user=user.mention_html(),
+                duration=format_afk_time(delta)
+            )
+
+            sent_msg = await update.message.reply_html(
+                message,
+                reply_markup=create_delete_keyboard()
+            )
+            asyncio.create_task(delete_message_after_delay(sent_msg, 60))
+            log_with_user_info("INFO", f"✅ User returned from AFK after {format_afk_time(delta)}", user_info)
+        else:
+            sent_msg = await update.message.reply_text(
+                "You are not AFK.",
+                reply_markup=create_delete_keyboard()
+            )
+            asyncio.create_task(delete_message_after_delay(sent_msg, 60))
+            log_with_user_info("INFO", "ℹ️ User tried /back but was not AFK", user_info)
+    except Exception as e:
+        logger.error(f"❌ Error in back command: {e}")
+        log_with_user_info("ERROR", f"❌ Error in back command: {e}", user_info)
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /ping command"""
+    user_info = extract_user_info(update.message)
+    log_with_user_info("INFO", "🏓 /ping command received", user_info)
+    
+    try:
+        start_time = time.time()
+
+        # Send initial "Pinging..." message
+        sent_msg = await update.message.reply_text("🛰️ Pinging...")
+
+        # Calculate ping time
+        end_time = time.time()
+        ping_ms = round((end_time - start_time) * 1000, 2)
+
+        # Create the pong message with group links (no preview)
+        pong_text = f'🏓 <a href="https://t.me/SoulMeetsHQ">Pong!</a> {ping_ms}ms'
+
+        # Edit the message to show pong result
+        await sent_msg.edit_text(
+            pong_text,
+            parse_mode='HTML',
+            disable_web_page_preview=True
+        )
+        
+        log_with_user_info("INFO", f"✅ Ping response sent: {ping_ms}ms", user_info)
+    except Exception as e:
+        logger.error(f"❌ Error in ping command: {e}")
+        log_with_user_info("ERROR", f"❌ Error in ping command: {e}", user_info)
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all incoming messages"""
+    if not update.message:
+        return
+    
+    try:
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+        
+        if user.is_bot:
+            logger.debug(f"🤖 Ignoring message from bot: {user.username}")
+            return
+            
+        user_info = extract_user_info(update.message)
+        logger.debug(f"💬 Processing message from user")
+        
+        now = datetime.now(timezone.utc)
+        await update_last_seen(chat_id, user.id, now)
+        
+        # Check if user was AFK and auto-return them
+        afk = await get_afk(chat_id, user.id)
+        if afk:
+            delta = now - afk["since"]
+            await remove_afk(chat_id, user.id)
+
+            message = random.choice(BACK_MESSAGES).format(
+                user=user.mention_html(),
+                duration=format_afk_time(delta)
+            )
+
+            sent_msg = await update.message.reply_html(
+                message,
+                reply_markup=create_delete_keyboard()
+            )
+            asyncio.create_task(delete_message_after_delay(sent_msg, 60))
+            log_with_user_info("INFO", f"🔄 Auto-returned user from AFK after {format_afk_time(delta)}", user_info)
+        
+        # Check if user replied to someone who is AFK
+        if update.message.reply_to_message:
+            replied_user = update.message.reply_to_message.from_user
+            if replied_user:
+                logger.debug(f"📤 Message is a reply to user {replied_user.id}")
+                afk = await get_afk(chat_id, replied_user.id)
+                if afk:
+                    delta = now - afk["since"]
+
+                    message = random.choice(AFK_STATUS_MESSAGES).format(
+                        user=replied_user.mention_html(),
+                        reason=afk['reason'],
+                        duration=format_afk_time(delta)
+                    )
+
+                    sent_msg = await update.message.reply_html(
+                        message,
+                        reply_markup=create_delete_keyboard()
+                    )
+                    asyncio.create_task(delete_message_after_delay(sent_msg, 60))
+                    log_with_user_info("INFO", f"ℹ️ Notified about AFK user: {replied_user.full_name}", user_info)
+    except Exception as e:
+        logger.error(f"❌ Error in message handler: {e}")
 
 async def check_inactivity():
-    """Check for inactive users efficiently"""
-    await asyncio.sleep(10)
+    """Background task to check for inactive users and set them AFK"""
+    logger.info("⏰ Starting inactivity checker task")
+    await asyncio.sleep(10)  # Initial delay
     
+    check_count = 0
     while True:
         try:
+            check_count += 1
+            logger.debug(f"🔍 Running inactivity check #{check_count}")
+            
             now = datetime.now(timezone.utc)
             records = await get_all_last_seen()
             
-            # Process in parallel
-            tasks = []
+            inactive_users = 0
             for record in records:
                 chat_id = record["chat_id"]
                 user_id = record["user_id"]
                 last_time = record["seen_at"]
                 inactive_time = now - last_time
                 
-                if inactive_time > timedelta(minutes=60):
-                    # Check if already AFK
-                    afk = await get_afk(chat_id, user_id)
-                    if not afk:
-                        tasks.append(
-                            set_afk(chat_id, user_id, "No activity", last_time)
-                        )
+                afk = await get_afk(chat_id, user_id)
+                if inactive_time > timedelta(minutes=60) and not afk:
+                    await set_afk(chat_id, user_id, "No activity", last_time)
+                    inactive_users += 1
+                    logger.info(f"😴 Auto-set user {user_id} as AFK due to {format_afk_time(inactive_time)} of inactivity")
             
-            # Execute all AFK updates in parallel
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if check_count % 10 == 0:  # Log summary every 10 checks
+                logger.info(f"📊 Inactivity check #{check_count}: {len(records)} users monitored, {inactive_users} set as AFK")
                 
         except Exception as e:
-            logger.error(f"❌ Inactivity checker error: {e}")
+            logger.error(f"❌ Error in inactivity checker: {e}")
         
-        await asyncio.sleep(60)
-
-async def cache_cleaner():
-    """Periodically clean expired cache entries"""
-    while True:
-        await asyncio.sleep(300)  # Every 5 minutes
-        try:
-            await afk_cache.clear_expired()
-            await last_seen_cache.clear_expired()
-            await user_info_cache.clear_expired()
-        except Exception as e:
-            logger.error(f"❌ Cache cleaner error: {e}")
-
-# Web server for health checks
-async def health_check(request):
-    """Health check endpoint"""
-    return web.Response(text="AFK bot is alive!", status=200)
-
-async def start_web_server():
-    """Start async web server"""
-    try:
-        app = web.Application()
-        app.router.add_get('/', health_check)
-        app.router.add_get('/health', health_check)
-        
-        port = int(os.environ.get("PORT", 10000))
-        runner = web.AppRunner(app)
-        await runner.setup()
-        
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        
-        logger.info(f"🌐 Web server started on port {port}")
-    except Exception as e:
-        logger.error(f"❌ Web server error: {e}")
+        await asyncio.sleep(60)  # Check every minute
 
 async def main():
-    """Main bot function with full async"""
-    logger.info("🤖 Starting bot...")
-    
-    # Start async logger
-    await async_handler.start()
-    
-    # Initialize tasks list
-    tasks = []
+    """Main bot function"""
+    logger.info("🤖 Starting main bot function")
     
     try:
-        # Initialize database
+        # Initialize database first
         await init_database()
         
-        # Build application
         app = ApplicationBuilder().token(TOKEN).build()
+        logger.info("✅ Bot application built successfully")
         
-        # Set commands
+        # Only register visible commands in the menu
         commands = [
             BotCommand("start", "Start bot and see help"),
             BotCommand("afk", "Set yourself AFK"),
             BotCommand("back", "Return from AFK"),
-            BotCommand("ping", "Check bot response time"),
         ]
         
         await app.bot.set_my_commands(commands)
-        
-        # Add handlers
+        logger.info(f"📋 Bot commands registered: {[cmd.command for cmd in commands]}")
+
+        # Add handlers (ping command is added but not registered in menu)
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("afk", afk_command))
         app.add_handler(CommandHandler("back", back_command))
-        app.add_handler(CommandHandler("ping", ping_command))
+        app.add_handler(CommandHandler("ping", ping_command))  # Hidden command
         app.add_handler(CallbackQueryHandler(delete_callback, pattern="delete_message"))
         app.add_handler(MessageHandler(filters.ALL, message_handler))
         
-        # Start background tasks
-        tasks = [
-            asyncio.create_task(process_message_queue()),
-            asyncio.create_task(process_deletion_queue()),
-            asyncio.create_task(check_inactivity()),
-            asyncio.create_task(cache_cleaner()),
-            asyncio.create_task(start_web_server()),
-        ]
+        logger.info("✅ All handlers registered successfully")
+
+        # Start background task
+        asyncio.create_task(check_inactivity())
+        logger.info("⏰ Inactivity checker task started")
         
-        logger.info("🚀 Bot started successfully!")
+        logger.info("🚀 Bot started with PostgreSQL database storage...")
         
-        # Run bot
-        await app.run_polling(drop_pending_updates=True)
-        
+        try:
+            await app.run_polling()
+        finally:
+            # Clean up database connection when bot stops
+            await close_database()
+            
     except Exception as e:
-        logger.error(f"❌ Critical error: {e}")
-        raise
-    finally:
-        # Cleanup
-        logger.info("🧹 Cleaning up...")
-        
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        
+        logger.error(f"❌ Critical error in main function: {e}")
         await close_database()
-        await async_handler.stop()
-        executor.shutdown(wait=False)
+        raise
+
+class DummyHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for health checks"""
+    
+    def do_GET(self):
+        logger.debug(f"🌐 Health check request from {self.client_address[0]}")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"AFK bot is alive!")
+
+    def do_HEAD(self):
+        logger.debug(f"🌐 HEAD request from {self.client_address[0]}")
+        self.send_response(200)
+        self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Override to prevent default HTTP logging"""
+        pass
+
+def start_dummy_server():
+    """Start HTTP server for health checks"""
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        server = HTTPServer(("0.0.0.0", port), DummyHandler)
+        logger.info(f"🌐 HTTP health check server started on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"❌ Error starting HTTP server: {e}")
 
 if __name__ == "__main__":
+    logger.info("🎬 Application starting...")
+    
     try:
-        asyncio.run(main())
+        # Start HTTP server in background
+        threading.Thread(target=start_dummy_server, daemon=True).start()
+        
+        # Start main bot
+        asyncio.get_event_loop().run_until_complete(main())
     except KeyboardInterrupt:
-        logger.info("⏹️ Bot stopped")
+        logger.info("⏹️ Bot stopped by user")
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}")
         raise
