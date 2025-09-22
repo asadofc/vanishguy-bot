@@ -1,6 +1,13 @@
-python-telegram-bot==20.3
-python-dotenv==1.0.0
-nest-asyncio==1.6.0
-asyncpg==0.30.0
+#python-telegram-bot==20.3
+#python-dotenv==1.0.0
+#nest-asyncio==1.6.0
+#asyncpg==0.30.0
 
-# 4
+
+python-telegram-bot
+python-dotenv
+nest-asyncio
+asyncpg
+aiohttp
+aiofiles
+uvloop
